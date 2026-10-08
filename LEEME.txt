@@ -1,0 +1,32 @@
+FIRST PERSON OVERHAUL IV - MOD DE PRIMERA PERSONA  --  GTA IV Complete Edition 1.2.0.59
+=================================================================================
+Mod de primera persona (a pie, en vehiculos, trenes y cinematicas) para GTA IV.
+Es una version mejorada del "GTA IV First-Person Mod" de Thomaxius:
+https://github.com/Thomaxius/gta-iv-first-person-mod
+
+LO PRINCIPAL
+- La primera persona ahora esta en la rotacion de camaras del juego: con el boton de camara
+  (touchpad en DualSense, Back en Xbox, V en teclado) pasas por cerca, normal, lejos y PRIMERA PERSONA.
+- Compatible con mando (DualSense o Xbox) ademas de mouse y teclado.
+
+QUE AGREGA ESTA VERSION
+- Mando: la primera persona es un paso mas del boton de camara del juego (touchpad / Back / V).
+  El stick derecho y el mouse miran alrededor; en el auto el stick gira la cabeza (vuelve sola al soltar).
+- Camara de manejo suave a cualquier velocidad: compensa el retraso de la cabeza de Niko,
+  fuerzas G al frenar/doblar y sigue el golpe de la cabeza en los choques.
+- Pelea cuerpo a cuerpo: el rival queda centrado en pantalla.
+- FOV sin efecto ojo de pez, mirar hacia abajo muestra el cuerpo, Niko se da vuelta si miras atras.
+
+INSTALAR
+Copiar el contenido de "Main files" a la carpeta del juego (donde esta GTAIV.exe).
+Necesita un cargador de .asi (FusionFix ya trae uno).
+
+RECOMENDADO
+"Better First Person Driving Animations" de bigchunkusamogus (no viene incluido, bajalo de su pagina):
+https://www.nexusmods.com/gta4/mods/1232
+
+TECLAS
+- Boton de camara: incluye la primera persona en el ciclo.
+- F7: primera persona si/no.  F5: guardar ajustes.  Ctrl+F5: recargar el .ini.  Ctrl+F7: modo debug.
+
+Ajustes en plugins\FirstPersonCutscene.ini (cada opcion tiene su explicacion).
