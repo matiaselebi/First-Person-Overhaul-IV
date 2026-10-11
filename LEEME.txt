@@ -11,11 +11,25 @@ LO PRINCIPAL
 
 QUE AGREGA ESTA VERSION
 - Mando: la primera persona es un paso mas del boton de camara del juego (touchpad / Back / V).
-  El stick derecho y el mouse miran alrededor; en el auto el stick gira la cabeza (vuelve sola al soltar).
+  El stick derecho y el mouse miran alrededor; en el auto el stick gira la cabeza (vuelve sola al soltar)
+  y al mirar a los costados te asomas: a la derecha hacia el centro del auto, a la izquierda hacia la ventana.
 - Camara de manejo suave a cualquier velocidad: compensa el retraso de la cabeza de Niko,
   fuerzas G al frenar/doblar y sigue el golpe de la cabeza en los choques.
-- Pelea cuerpo a cuerpo: el rival queda centrado en pantalla.
-- FOV sin efecto ojo de pez, mirar hacia abajo muestra el cuerpo, Niko se da vuelta si miras atras.
+- Choques segun el lado: choque de frente = la cabeza va hacia adelante y abajo, si te chocan
+  de atras va hacia atras, si te pegan de la izquierda va a la izquierda (y se inclina), y al
+  caer de un salto baja. Sirve si chocas vos o si te chocan (ImpactShake).
+- La camara se mueve con el auto y el cuerpo de Niko: se inclina en subidas, pozos y curvas
+  peraltadas y acompana los movimientos de su cabeza (BodyFollow; 0 = camara siempre derecha).
+- A pie la vista se mece un poco con la cabeza al caminar, correr o recibir un golpe
+  (HeadSway; se apaga con HeadSwayEnabled = 0 o desde el menu). Nunca mientras apuntas.
+- La posicion del asiento se mide apenas te quedas quieto en el auto, aunque estes en tercera
+  persona, y cada modelo de auto recuerda la suya ([CarSeatPoses] en el .ini). Asi, al pasar a
+  primera persona andando rapido, la camara ya esta bien en cualquier auto.
+- Pelea cuerpo a cuerpo: el rival queda en el centro de la pantalla, con o sin fijar el
+  objetivo (sin fijarlo, el mod elige al rival mas cercano que tengas adelante).
+- FOV sin efecto ojo de pez, Niko se da vuelta si miras atras.
+- Mirar hacia abajo muestra el cuerpo y no el interior del cuello: el ojo se adelanta sobre el pecho
+  y lo que esta pegado a la camara no se dibuja (NearClip), asi no se ven el cuello ni los hombros por dentro.
 
 INSTALAR
 Copiar el contenido de "Main files" a la carpeta del juego (donde esta GTAIV.exe).
@@ -27,6 +41,9 @@ https://www.nexusmods.com/gta4/mods/1232
 
 TECLAS
 - Boton de camara: incluye la primera persona en el ciclo.
-- F7: primera persona si/no.  F5: guardar ajustes.  Ctrl+F5: recargar el .ini.  Ctrl+F7: modo debug.
+- F7: primera persona si/no.  F5: guardar ajustes.  Modo debug: DebugMode = 1 en el .ini.
+- Ctrl+F5 (o L3 + R3 en el mando): menu de ajustes dentro del juego. Flechas o cruceta para elegir
+  y cambiar; los cambios se ven al instante y se guardan en el .ini al cerrar el menu.
+  Ctrl+F6 y Ctrl+F7 quedan libres para los menus de Project Birds CE y Project Thunder CE.
 
 Ajustes en plugins\FirstPersonCutscene.ini (cada opcion tiene su explicacion).

@@ -30,13 +30,13 @@
 // defaults on first run; see the "settings (.ini)" section below). Everything
 // else (live eye height/forward/FOV tuning, cutscene actor slot, head-bone
 // rotation test, native invoker toggle, diagnostics dump) is gated behind a
-// debug mode, off by default, toggled with Ctrl+F7.
+// debug mode, off by default (DebugMode = 1 in the .ini).
 //   F8 diagnostics dump   F9 recenter view
 //   F11/F12 eye height -/+   Left/Right eye forward   PgUp/PgDn FOV
 //   B head-bone rotation test   J force head-hide off   7/8 cutscene actor slot
 //   F6 native invoker on/off   K/L/M/N aim options
 //   F5 (SaveKey; works outside debug mode too) save the current settings into the
-//   .ini, with an on-screen confirmation   Ctrl+F5 reload the .ini
+//   .ini, with an on-screen confirmation   Ctrl+F5 (or L3 + R3) the in-game settings menu
 // Eye height / forward / FOV are stored per context (on foot / car / train).
 //
 // Build: x86 DLL, /MT, no PCH, output extension .asi, next to GTAIV.exe.
@@ -125,14 +125,15 @@ static void FpSehInit()
 // git tag while a release is current (v0.5.0-beta); between tags, bump the base
 // version and add an alphaN suffix, bumping N each time a new build gets handed
 // over and resetting to alpha1 whenever a real tag lands.
-#define FPMOD_VERSION "0.5.0-beta-pad19"
+#define FPMOD_VERSION "1.1.0"
 
 static uintptr_t g_moduleBase = 0;
 static size_t    g_moduleSize = 0;
 static uintptr_t g_hookReturn = 0;
+static uintptr_t g_hookReturn2 = 0;   // pad24: past the frame's near-clip copy too (the stub copies it before our hook)
 
 static volatile uint8_t  g_enabled = 0;
-static volatile int      g_debugMode = 0;   // off by default -- Ctrl+F7 toggles it (or DebugMode in the .ini).
+static volatile int      g_debugMode = 0;   // off by default -- DebugMode in the .ini (Ctrl+F7 is Project Thunder CE's menu now).
                                              // Unlocks every live-tuning key except the on/off key itself.
 static volatile float    g_eyeUp = 0.60f;
 static volatile int      g_useNatives = 1;   // on by default now (F6 still toggles for debug)
@@ -146,8 +147,8 @@ static volatile float    g_fovBoostV[3] = { 21.0f, 30.0f, 18.0f };   // extra FO
 static volatile float    g_mouseSens = 0.0016f;
 static volatile int      g_invertY = 0;         // .ini InvertY
 static volatile float    g_maxPitch = 1.30f;    // look up/down limit, radians (~74.5 deg); .ini MaxPitchDegrees
-static volatile int      g_toggleVk = VK_F7;    // first-person on/off key; .ini ToggleKey (Ctrl + it = debug mode)
-static volatile int      g_saveVk = VK_F5;      // saves the current settings to the .ini (Ctrl + it reloads); 0 = disabled
+static volatile int      g_toggleVk = VK_F7;    // first-person on/off key; .ini ToggleKey (Ctrl + it does nothing)
+static volatile int      g_saveVk = VK_F5;      // saves the current settings to the .ini (Ctrl + it = settings menu); 0 = disabled
 static volatile int      g_showMsgs = 1;        // .ini ShowMessages: short on-screen text when settings are saved / reloaded
 static char              g_toastText[128] = { 0 };
 static volatile int      g_toastReq = 0;        // set by any thread, shown by the next sim-thread poll (natives are sim-thread only)
@@ -211,6 +212,24 @@ static volatile float g_carLookRightDeg = 140.f;// [Controller] CarLookMaxRightD
 static volatile int   g_carTransition = 0;
 static volatile float g_simAccF = 0.f, g_simAccS = 0.f;   // pad15: car g-forces from the physics speed (sim thread)
 static volatile int   g_simAccOK = 0;
+// pad21: crash jolts, body follow and head sway
+static volatile float g_impSumF = 0.f, g_impSumS = 0.f, g_impSumU = 0.f;   // running sum of the car's velocity jumps (car axes, m/s; sim -> render)
+static volatile float g_carBodyFollow = 0.7f;   // [Car] BodyFollow
+static volatile float g_impactShake = 1.0f;     // [Car] ImpactShake
+static volatile float g_footHeadSway = 0.5f;    // [OnFoot] HeadSway
+static volatile int   g_footSwayOn = 1;         // [OnFoot] HeadSwayEnabled (pad22: switch it off without losing the amount)
+static volatile uint32_t g_carModel = 0;        // pad23: model of the vehicle Niko is in (sim thread), 0 = none
+static volatile float g_carLeanLeft = 0.12f;    // pad24: [Car] LookLeanLeft  -- metres toward the window at the full left turn
+static volatile float g_carLeanRight = 0.30f;   // pad24: [Car] LookLeanRight -- metres toward the middle at the full right turn
+static volatile float g_nearClip = 0.12f;       // pad24: [General] NearClip -- nothing nearer than this is drawn
+static volatile int   g_nearClipOK = 0;         // pad24: the hook can set the frame's near clip (bytes checked at install)
+static volatile int   g_phoneOut = 0;           // pad24: the phone is in Niko's hand (any phone task)
+static volatile int   g_onBike = 0;             // pad24: IS_CHAR_ON_ANY_BIKE -- bikes keep their own fallback seat pose
+static volatile LONG  g_hudToggleReq = 0;       // pad22: Ctrl + SaveKey asks the sim thread to open / close the settings menu
+static volatile int   g_hudOpen = 0;            // pad22: the in-game settings menu is up
+static float g_kickPitch = 0.f, g_kickRoll = 0.f;           // head rotation on top of the view (render thread), radians
+static float g_carTiltP = 0.f, g_carTiltR = 0.f; static int g_carTiltOK = 0;   // car pitch / roll to follow (render thread)
+static float g_footHead[16] = { 0 }; static int g_footHeadOK = 0;               // this frame's head bone on foot (render thread)
 static volatile float g_vehHeading = 0.f;       // pad8: the vehicle's own heading (degrees) -- the seat faces this way
 static volatile int   g_vehHeadingOK = 0;
 static volatile int   g_bodyTurn = 1;
@@ -544,6 +563,7 @@ static void InstallMouseHook()
 }
 
 static void PollNatives();     // fwd decl -- called here so natives run on the main thread
+static void HudFrame();        // pad22: the in-game settings menu (defined after the .ini code)
 
 static float WrapPi(float a)
 {
@@ -671,6 +691,391 @@ static void AdjustAimFwd(float d)
 }
 
 // ---- hook body -------------------------------------------------
+// pad7..pad23: the car seat pose, head lag, g-force lean, crash jolts and body follow. Runs every frame
+// while Niko is in a vehicle -- also in third person, so the seated pose of the car you just got into is
+// already measured when you switch to first person at speed. Fills hx / hy / hz (the eye) once the pose
+// is known; the per-frame update happens only once per game frame however often it is called.
+static void CarPoseBlock(bool inCs, int vi, float& hx, float& hy, float& hz)
+{
+    static float s_loc[3] = { 0, 0, 0 }; static int s_locOK = 0; static int s_locExact = 0;
+    static float s_dyn[3] = { 0, 0, 0 }; static int s_dynOK = 0;
+    static float s_vel[2] = { 0, 0 }, s_velPrev[2] = { 0, 0 }; static int s_velOK = 0;
+    static float s_accF = 0.f, s_accS = 0.f, s_leanF = 0.f, s_leanS = 0.f;
+    static float s_crashT = 0.f, s_crashW = 0.f, s_crashDev[3] = { 0, 0, 0 };
+    static float s_prevRoot[3] = { 0, 0, 0 }; static uint32_t s_prevFc = 0; static float s_speed = 0.f;
+    static LONGLONG s_prevQ = 0;
+    static float s_jx[3] = { 0, 0, 0 }, s_jvel[3] = { 0, 0, 0 }, s_jSeen[3] = { 0, 0, 0 }; static int s_jSeenOK = 0;   // pad21 crash-jolt spring (fwd, right, up)
+    static float s_tP = 0.f, s_tR = 0.f;                                                                         // pad21 car pitch / roll
+    static float s_hlBase[2] = { 0, 0 }, s_hlDev[2] = { 0, 0 }; static int s_hlOK = 0;                            // pad21 head lean vs the car
+    static float s_hist[6][12]; static int s_histN = 0;            // pad9: the last few root matrices
+    static float s_mean[6][3], s_var[6]; static int s_varN = 0;    // pad9: head-lag statistics
+    static uint32_t s_lastRunFc = 0;                               // pad22: last frame this block ran
+    static uint32_t s_poseModel = 0;                               // pad23: car model whose seat pose is loaded
+    if (!inCs && (g_inCar || g_carTransition) && !g_inTrain && g_GetBoneMtx && g_FindPlayerPed)
+    {
+        void* pd = g_FindPlayerPed(0);
+        float* rm = pd ? *(float**)((char*)pd + 0x20) : nullptr;
+        if (rm)
+        {
+            const uint32_t fcn = FrameNo();
+            // pad22: a new stint in a vehicle -- first person was off for a while (switched on again in
+            // this or another car), a save was loaded, a cutscene or the pause menu ran, or the root
+            // jumped (teleport). Everything learned live is from another car / place then: start over
+            // like the first car of a session (seated pose from the .ini at speed, re-learned when
+            // stopped). Before this the old car's pose and history stayed, and at speed the view sat
+            // wrong until the car stopped.
+            {
+                const float jx = rm[12] - s_prevRoot[0], jy = rm[13] - s_prevRoot[1], jz = rm[14] - s_prevRoot[2];
+                const bool jump = s_histN > 0 && jx * jx + jy * jy + jz * jz > 6.f * 6.f;
+                if (s_lastRunFc == 0 || fcn - s_lastRunFc > 4u || jump)
+                {
+                    if (s_locOK || s_histN) Log("pad22 vehicle: new stint (%s) -- seat pose starts over", jump ? "jump" : "gap");
+                    s_locOK = 0; s_locExact = 0; s_dynOK = 0; s_velOK = 0; s_histN = 0; s_varN = 0; s_prevQ = 0; s_prevFc = 0; s_speed = 0.f;
+                    s_leanF = s_leanS = s_accF = s_accS = 0.f; s_crashT = s_crashW = 0.f;
+                    for (int j = 0; j < 3; ++j) { s_crashDev[j] = 0.f; s_jx[j] = 0.f; s_jvel[j] = 0.f; }
+                    s_jSeenOK = 0; s_hlOK = 0; s_hlDev[0] = s_hlDev[1] = 0.f; s_tP = s_tR = 0.f;
+                    s_poseModel = 0;
+                }
+                s_lastRunFc = fcn;
+            }
+            if (fcn != s_prevFc)
+            {
+                LARGE_INTEGER q; QueryPerformanceCounter(&q);
+                LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+                const float dt = s_prevQ ? (float)((double)(q.QuadPart - s_prevQ) / (double)qf.QuadPart) : 0.f;
+                if (dt > 0.001f && dt < 0.25f)
+                {
+                    const float ddx = rm[12] - s_prevRoot[0], ddy = rm[13] - s_prevRoot[1], ddz = rm[14] - s_prevRoot[2];
+                    s_speed = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz) / dt;
+                }
+                // pad12: g-forces. Velocity from the root, then its change = acceleration in the car's
+                // own axes; braking / crashing throws the eye forward, corners push it sideways.
+                if (dt > 0.001f && dt < 0.25f)
+                {
+                    const float vx = (rm[12] - s_prevRoot[0]) / dt, vy = (rm[13] - s_prevRoot[1]) / dt;
+                    const float kv = 1.f - expf(-dt / 0.03f);
+                    s_vel[0] += (vx - s_vel[0]) * kv; s_vel[1] += (vy - s_vel[1]) * kv;
+                    if (s_velOK)
+                    {
+                        const float ax = (s_vel[0] - s_velPrev[0]) / dt, ay = (s_vel[1] - s_velPrev[1]) / dt;
+                        const float aFwd = ax * rm[4] + ay * rm[5];     // + = speeding up
+                        const float aSide = ax * rm[0] + ay * rm[1];    // + = pushed to the right
+                        const float ka = 1.f - expf(-dt / 0.035f);
+                        s_accF += (aFwd - s_accF) * ka; s_accS += (aSide - s_accS) * ka;
+                        if (g_simAccOK) { s_accF = g_simAccF; s_accS = g_simAccS; }   // pad15
+                    }
+                    s_velPrev[0] = s_vel[0]; s_velPrev[1] = s_vel[1]; s_velOK = 1;
+                    // target lean: forward when braking / crashing, sideways (outward) in corners
+                    float tF = -s_accF * 0.022f; if (tF < -0.04f) tF = -0.04f; if (tF > 0.30f) tF = 0.30f;
+                    float tS = -s_accS * 0.012f; if (tS > 0.10f) tS = 0.10f; if (tS < -0.10f) tS = -0.10f;
+                    const float kF = 1.f - expf(-dt / (tF > s_leanF ? 0.06f : 0.20f));   // pad13: quicker whip and settle
+                    const float kS = 1.f - expf(-dt / 0.10f);
+                    // pad13: crash = a big jolt; for a moment the eye follows Niko's real head
+                    if (fabsf(s_accF) > 18.f || fabsf(s_accS) > 14.f) s_crashT = 1.6f;
+                    else if (s_crashT > 0.f) s_crashT -= dt;
+                    s_leanF += (tF - s_leanF) * kF; s_leanS += (tS - s_leanS) * kS;
+                    // pad21: crash jolts. The sim thread sums the car's sudden velocity changes (in the
+                    // car's own axes); each new one kicks a damped spring that throws the head the OTHER
+                    // way: hit from the left -> the head goes left and tilts that way; front crash ->
+                    // forward and down; rear-ended -> back and up; a hard landing -> down.
+                    {
+                        const float sF = g_impSumF, sS = g_impSumS, sU = g_impSumU;
+                        if (s_jSeenOK)
+                        {
+                            const float g = 0.55f * g_impactShake;
+                            float vF = -(sF - s_jSeen[0]) * g, vS = -(sS - s_jSeen[1]) * g, vU = -(sU - s_jSeen[2]) * g * 0.6f;
+                            const float vm = sqrtf(vF * vF + vS * vS + vU * vU);
+                            if (vm > 4.0f) { const float c = 4.0f / vm; vF *= c; vS *= c; vU *= c; }
+                            s_jvel[0] += vF; s_jvel[1] += vS; s_jvel[2] += vU;
+                        }
+                        s_jSeen[0] = sF; s_jSeen[1] = sS; s_jSeen[2] = sU; s_jSeenOK = 1;
+                        const float w = 2.f * 3.14159265f * 2.2f, zt = 0.42f;   // ~2 Hz, a bounce and a half
+                        int n = (int)(dt * 240.f) + 1; if (n > 60) n = 60;
+                        const float hs = dt / (float)n;
+                        for (int i = 0; i < n; ++i)
+                            for (int j = 0; j < 3; ++j)
+                            {
+                                s_jvel[j] += (-w * w * s_jx[j] - 2.f * zt * w * s_jvel[j]) * hs;
+                                s_jx[j] += s_jvel[j] * hs;
+                            }
+                    }
+                    // pad21: body follow -- the car's own pitch / roll (hills, bumps, banking), from the
+                    // fresh ped root, which sits in the seat and tilts with the car
+                    {
+                        const float fh = sqrtf(rm[4] * rm[4] + rm[5] * rm[5]);
+                        float p = atan2f(rm[6], fh), r = atan2f(rm[2], rm[10]);
+                        if (!(rm[10] > 0.35f) || !(fh > 0.2f)) { p = 0.f; r = 0.f; }   // rolled over: keep the view level
+                        if (p > 0.6f) p = 0.6f; if (p < -0.6f) p = -0.6f;
+                        if (r > 0.35f) r = 0.35f; if (r < -0.35f) r = -0.35f;   // bikes lean far more than a head does
+                        const float k = 1.f - expf(-dt / 0.05f);
+                        s_tP += (p - s_tP) * k; s_tR += (r - s_tR) * k;
+                    }
+                }
+                s_prevQ = q.QuadPart; s_prevFc = fcn;
+                s_prevRoot[0] = rm[12]; s_prevRoot[1] = rm[13]; s_prevRoot[2] = rm[14];
+                float b[16];
+                g_GetBoneMtx(pd, b, 1205);
+                // pad9: keep the last few root matrices. The head bone lags the root by a frame or
+                // two; find WHICH old root it matches (the one whose head offset stays steadiest at
+                // speed) and use that offset live -- so braking, crashing and cornering move the eye
+                // with Niko's head (the lean), instead of his body sliding into view.
+                // (s_hist / s_histN live at the top of this block: a new stint clears them)
+                for (int h = 5; h > 0; --h) memcpy(s_hist[h], s_hist[h - 1], sizeof(s_hist[0]));
+                { const int idx[12] = { 0,1,2, 4,5,6, 8,9,10, 12,13,14 }; for (int j = 0; j < 12; ++j) s_hist[0][j] = rm[idx[j]]; }
+                if (s_histN < 6) ++s_histN;
+                // pad19: the head-bone lag and the seated head pose are remembered between sessions
+                // ([Internal] in the .ini), so the very first car of a session starts right even at speed.
+                static int s_bestK = -1; static float s_saved[3] = { 0, 0, 0 }; static int s_savedOK = 0;
+                // pad20: where a seated head can really be, relative to the ped root (x side, y forward,
+                // z up). Measured poses sit around (0, -0.1..-0.35, 0.47..0.65). A pose recorded while the
+                // root and the head bone were out of step (getting out, a warp) was saved as (0, -1.1, 0.58)
+                // and, loaded at the next session, put the first car's view behind Niko until it stopped.
+                auto seatPoseOK = [](const float* p) {
+                    return p[0] > -0.30f && p[0] < 0.30f && p[1] > -0.60f && p[1] < 0.40f && p[2] > 0.30f && p[2] < 0.90f;
+                };
+                if (s_bestK < 0)
+                {
+                    s_bestK = (int)GetPrivateProfileIntA("Internal", "CarHeadLag", 2, g_iniPath);
+                    if (s_bestK < 0 || s_bestK > 5) s_bestK = 2;
+                    char t[64] = { 0 };
+                    GetPrivateProfileStringA("Internal", "CarSeatPose", "", t, sizeof t, g_iniPath);
+                    if (sscanf(t, "%f,%f,%f", &s_saved[0], &s_saved[1], &s_saved[2]) == 3 && seatPoseOK(s_saved)) s_savedOK = 1;
+                    Log("pad19 remembered: lag=%d seatPose=%s%s", s_bestK, t[0] ? t : "none",
+                        (t[0] && !s_savedOK) ? " (implausible -- ignored)" : "");
+                }
+                // pad23: every car model remembers its own seated pose ([CarSeatPoses] in the .ini): a low sports
+                // car, a truck and a bike seat the head differently. Learned the first time you sit still in that
+                // model (in any camera); until then the last car's pose is the guess.
+                {
+                    const uint32_t mdl = g_carModel;
+                    if (mdl && mdl != s_poseModel && g_inCar)
+                    {
+                        s_poseModel = mdl;
+                        char key[16], t[64] = { 0 }; snprintf(key, sizeof key, "0x%08X", mdl);
+                        GetPrivateProfileStringA("CarSeatPoses", key, "", t, sizeof t, g_iniPath);
+                        float pm[3] = { 0, 0, 0 };
+                        if (sscanf(t, "%f,%f,%f", &pm[0], &pm[1], &pm[2]) == 3 && seatPoseOK(pm))
+                        {
+                            s_saved[0] = pm[0]; s_saved[1] = pm[1]; s_saved[2] = pm[2]; s_savedOK = 1;
+                            if (s_locOK && !s_locExact) { s_loc[0] = pm[0]; s_loc[1] = pm[1]; s_loc[2] = pm[2]; }
+                            Log("pad23 car model %s: remembered seat pose %s", key, t);
+                        }
+                        else
+                        {
+                            // pad24: no pose for this model yet -> the last one of the same kind (a scooter's rider
+                            // sits ~0.6 m further forward than a car's driver, so bikes and the rest are kept apart)
+                            char g[64] = { 0 };
+                            GetPrivateProfileStringA("Internal", g_onBike ? "BikeSeatPose" : "CarSeatPose", "", g, sizeof g, g_iniPath);
+                            if (sscanf(g, "%f,%f,%f", &pm[0], &pm[1], &pm[2]) == 3 && seatPoseOK(pm))
+                            {
+                                s_saved[0] = pm[0]; s_saved[1] = pm[1]; s_saved[2] = pm[2]; s_savedOK = 1;
+                                if (s_locOK && !s_locExact) { s_loc[0] = pm[0]; s_loc[1] = pm[1]; s_loc[2] = pm[2]; }
+                            }
+                            Log("pad23 car model %s: no seat pose yet (learned once you sit still); using the last %s pose %s",
+                                key, g_onBike ? "bike" : "car", g[0] ? g : "-");
+                        }
+                    }
+                }
+                const bool boneOK = (b[12] || b[13] || b[14]);
+                if (boneOK)
+                {
+                    float lk[6][3];
+                    for (int k = 0; k < s_histN; ++k)
+                    {
+                        const float* H = s_hist[k];
+                        const float dx = b[12] - H[9], dy = b[13] - H[10], dz = b[14] - H[11];
+                        lk[k][0] = dx * H[0] + dy * H[1] + dz * H[2];
+                        lk[k][1] = dx * H[3] + dy * H[4] + dz * H[5];
+                        lk[k][2] = dx * H[6] + dy * H[7] + dz * H[8];
+                    }
+                    // pad21: body follow -- how Niko's head nods / leans relative to the car (steering lean,
+                    // bumps, being thrown in a crash). Measured against the root matrix that matches the
+                    // head bone's lag, and only its quick part: a slow baseline is taken out, so his seated
+                    // posture (or where his head happens to look) never tilts the view for long.
+                    if (dt > 0.001f && dt < 0.25f && g_inCar && !g_carTransition)
+                    {
+                        const int kh = s_bestK >= 0 && s_bestK < s_histN ? s_bestK : s_histN - 1;
+                        const float* H = s_hist[kh];
+                        int fr = g_fwdRow & 3; if (fr > 2) fr = 0;
+                        const int rr = (fr + 1) % 3;
+                        const float sg = g_fwdSign ? -1.f : 1.f;
+                        const float fu = (b[fr * 4] * H[6] + b[fr * 4 + 1] * H[7] + b[fr * 4 + 2] * H[8]) * sg;
+                        const float ru = -(b[rr * 4] * H[6] + b[rr * 4 + 1] * H[7] + b[rr * 4 + 2] * H[8]) * sg;
+                        const float hp = asinf(fmaxf(-1.f, fminf(1.f, fu))), hr = asinf(fmaxf(-1.f, fminf(1.f, ru)));
+                        if (!s_hlOK) { s_hlBase[0] = hp; s_hlBase[1] = hr; s_hlOK = 1; }
+                        const float kb = 1.f - expf(-dt / 1.2f), kd = 1.f - expf(-dt / 0.06f);
+                        s_hlBase[0] += (hp - s_hlBase[0]) * kb; s_hlBase[1] += (hr - s_hlBase[1]) * kb;
+                        float d0 = hp - s_hlBase[0], d1 = hr - s_hlBase[1];
+                        if (d0 > 0.12f) d0 = 0.12f; if (d0 < -0.12f) d0 = -0.12f;
+                        if (d1 > 0.14f) d1 = 0.14f; if (d1 < -0.14f) d1 = -0.14f;
+                        s_hlDev[0] += (d0 - s_hlDev[0]) * kd; s_hlDev[1] += (d1 - s_hlDev[1]) * kd;
+                    }
+                    else if (!g_inCar || g_carTransition) { s_hlOK = 0; s_hlDev[0] = s_hlDev[1] = 0.f; }
+                    if (s_speed > 6.0f && s_histN == 6)
+                    {
+                        for (int k = 0; k < 6; ++k)
+                        {
+                            float e = 0.f;
+                            for (int j = 0; j < 3; ++j) { const float dd = lk[k][j] - s_mean[k][j]; e += dd * dd; s_mean[k][j] += dd * 0.05f; }
+                            s_var[k] = s_varN ? s_var[k] + (e - s_var[k]) * 0.02f : e;   // pad10: slower, steadier
+                        }
+                        if (++s_varN > 60)
+                        {
+                            int best = 0; for (int k = 1; k < 6; ++k) if (s_var[k] < s_var[best]) best = k;
+                            // pad10: only switch when clearly better (it flip-flopped in zig-zags)
+                            if (best != s_bestK && s_var[best] > s_var[s_bestK] * 0.6f) best = s_bestK;
+                            if (best != s_bestK)
+                            {
+                                s_bestK = best; Log("pad9 car head lag = %d frame(s)", best);
+                                char v[8]; snprintf(v, sizeof v, "%d", best);
+                                WritePrivateProfileStringA("Internal", "CarHeadLag", v, g_iniPath);
+                                // pad19: pose was only a moving guess -> redo it with the measured lag
+                                if (s_locOK && !s_locExact && best < s_histN && seatPoseOK(lk[best]))   // pad22: never a wrong frame
+                                { s_loc[0] = lk[best][0]; s_loc[1] = lk[best][1]; s_loc[2] = lk[best][2]; }
+                            }
+                        }
+                    }
+                    // pad13: first sample in the seat -> start from the lag-matched head right away
+                    // (before, the pose was only learned once the car nearly stopped).
+                    if (!s_locOK && g_inCar && !g_carTransition && s_histN >= 3)
+                    {
+                        int ks = s_bestK < s_histN ? s_bestK : s_histN - 1;
+                        if (s_savedOK && s_speed > 1.0f)
+                        {
+                            float bd = 1e9f; int kb = ks;
+                            for (int k = 0; k < s_histN; ++k)
+                            {
+                                if (!seatPoseOK(lk[k])) continue;
+                                const float d0 = lk[k][0] - s_saved[0], d1 = lk[k][1] - s_saved[1], d2 = lk[k][2] - s_saved[2];
+                                const float d = d0 * d0 + d1 * d1 + d2 * d2;
+                                if (d < bd) { bd = d; kb = k; }
+                            }
+                            if (bd < 0.25f * 0.25f) ks = kb;   // pad20: only trust a lag that really matches the saved pose
+                        }
+                        const float* l1 = (s_savedOK && s_speed > 1.0f && s_histN < 6) ? s_saved : lk[ks];
+                        if (!seatPoseOK(l1) && s_savedOK) l1 = s_saved;   // pad20: never seed from a wrong frame
+                        if (seatPoseOK(l1))
+                        {
+                            s_loc[0] = l1[0]; s_loc[1] = l1[1]; s_loc[2] = l1[2]; s_locOK = 1; s_locExact = (s_speed < 1.0f);
+                            Log("pad13 seat pose seeded while moving (%.1f m/s)", s_speed);
+                        }
+                    }
+                    // pad13: and keep refining it slowly while cruising smoothly
+                    if (s_locOK && s_speed >= 1.0f && s_varN > 60 && s_crashT <= 0.f && fabsf(s_accF) < 1.5f && fabsf(s_accS) < 1.5f)
+                    {
+                        const float* lc = lk[s_bestK < s_histN ? s_bestK : 1];
+                        if (fabsf(lc[0] - s_loc[0]) < 0.3f && fabsf(lc[1] - s_loc[1]) < 0.3f && fabsf(lc[2] - s_loc[2]) < 0.3f)
+                            for (int j = 0; j < 3; ++j) s_loc[j] += (lc[j] - s_loc[j]) * 0.01f;
+                    }
+                    // pad13: crash -- follow where the head is thrown (beyond a small dead zone)
+                    {
+                        const float* lc = lk[s_bestK < s_histN ? s_bestK : 1];
+                        static const float clo[3] = { -0.40f, -0.05f, -0.30f }, chi[3] = { 0.40f, 0.50f, 0.15f };
+                        for (int j = 0; j < 3; ++j)
+                        {
+                            float v = s_locOK ? lc[j] - s_loc[j] : 0.f;
+                            v = v > 0.05f ? v - 0.05f : (v < -0.05f ? v + 0.05f : 0.f);
+                            if (v > chi[j]) v = chi[j];
+                            if (v < clo[j]) v = clo[j];
+                            s_crashDev[j] += (v - s_crashDev[j]) * 0.35f;
+                        }
+                        const float wt = s_crashT > 0.f ? 1.f : 0.f;
+                        s_crashW += (wt - s_crashW) * (wt > s_crashW ? 0.4f : 0.06f);
+                    }
+                    // pad20: learn / save the seated pose only when really seated (not getting in or out),
+                    // when the pose is plausible, and once it has held still for ~half a second.
+                    static int s_still = 0; static float s_stillRef[3] = { 0, 0, 0 };
+                    bool settledOK = false;
+                    if (s_speed < 1.0f && fabsf(s_accF) < 1.0f && g_inCar && !g_carTransition && seatPoseOK(lk[0]))
+                    {
+                        const float e0 = lk[0][0] - s_stillRef[0], e1 = lk[0][1] - s_stillRef[1], e2 = lk[0][2] - s_stillRef[2];
+                        if (e0 * e0 + e1 * e1 + e2 * e2 < 0.03f * 0.03f) { if (s_still < 1000) ++s_still; }
+                        else { s_still = 0; s_stillRef[0] = lk[0][0]; s_stillRef[1] = lk[0][1]; s_stillRef[2] = lk[0][2]; }
+                        settledOK = s_still >= 30;
+                    }
+                    else s_still = 0;
+                    if (settledOK)    // pad12: only when really settled
+                    {
+                        const float* l0 = lk[0];
+                        {
+                            const float a = (s_locOK && s_locExact) ? 0.15f : 1.f;
+                            s_loc[0] += (l0[0] - s_loc[0]) * a; s_loc[1] += (l0[1] - s_loc[1]) * a; s_loc[2] += (l0[2] - s_loc[2]) * a;
+                            s_locOK = 1;
+                            static uint32_t s_saveFc = 0;
+                            if (!s_locExact || fcn - s_saveFc > 600)
+                            {
+                                s_saveFc = fcn;
+                                char v[64]; snprintf(v, sizeof v, "%.3f,%.3f,%.3f", s_loc[0], s_loc[1], s_loc[2]);
+                                WritePrivateProfileStringA("Internal", g_onBike ? "BikeSeatPose" : "CarSeatPose", v, g_iniPath);
+                            if (s_poseModel && s_poseModel == g_carModel)   // pad23: and for this car model
+                            {
+                                char key[16]; snprintf(key, sizeof key, "0x%08X", s_poseModel);
+                                WritePrivateProfileStringA("CarSeatPoses", key, v, g_iniPath);
+                            }
+                                s_saved[0] = s_loc[0]; s_saved[1] = s_loc[1]; s_saved[2] = s_loc[2]; s_savedOK = 1;
+                            }
+                            s_locExact = 1;
+                        }
+                    }
+                    // live offset (lag-matched), smoothed a touch and kept within 0.35 m of the seated pose
+                    const int kk = s_bestK < s_histN ? s_bestK : s_histN - 1;
+                    if (s_locOK && kk >= 0 && s_varN > 60)   // only once the lag has been measured
+                    {
+                        // pad10: per-axis limits around the seated pose (x side, y forward, z up). Never
+                        // BEHIND the seat pose -- that is what showed the body in zig-zags.
+                        static const float lo[3] = { -0.15f, -0.02f, -0.10f }, hi[3] = { 0.15f, 0.35f, 0.10f };
+                        for (int j = 0; j < 3; ++j)
+                        {
+                            float v = lk[kk][j] - s_loc[j];
+                            if (v > hi[j]) v = hi[j];
+                            if (v < lo[j]) v = lo[j];
+                            v += s_loc[j];
+                            s_dyn[j] = s_dynOK ? s_dyn[j] + (v - s_dyn[j]) * 0.3f : v;
+                        }
+                        s_dynOK = 1;
+                    }
+                }
+            }
+            if (s_locOK)
+            {
+                (void)s_dynOK;
+                // pad21: crash-jolt offset (kept off the headrest and out of the windscreen)
+                float jF = s_jx[0], jS = s_jx[1], jU = s_jx[2];
+                if (jF > 0.28f) jF = 0.28f; if (jF < -0.08f) jF = -0.08f;
+                if (jS > 0.22f) jS = 0.22f; if (jS < -0.22f) jS = -0.22f;
+                if (jU > 0.08f) jU = 0.08f; if (jU < -0.15f) jU = -0.15f;
+                float fwdOff = s_leanF + s_crashDev[1] * s_crashW + jF;
+                if (fwdOff > 0.50f) fwdOff = 0.50f;
+                const float L[3] = { s_loc[0] + s_leanS + s_crashDev[0] * s_crashW + jS,
+                                     s_loc[1] + fwdOff,
+                                     s_loc[2] + s_crashDev[2] * s_crashW + jU };
+                // ...and the head turns with it: forward -> nods down, back -> up, to the side -> tilts
+                // that way. Plus Niko's own head lean (body follow) and the car's tilt.
+                if (g_inCar && !g_carTransition)
+                {
+                    float kp = -s_jx[0] * 0.65f + s_jx[2] * 0.35f, kr = -s_jx[1] * 0.85f;
+                    if (kp > 0.20f) kp = 0.20f; if (kp < -0.20f) kp = -0.20f;
+                    if (kr > 0.22f) kr = 0.22f; if (kr < -0.22f) kr = -0.22f;
+                    const float bf = g_carBodyFollow;
+                    g_kickPitch = kp + s_hlDev[0] * 0.6f * bf;
+                    g_kickRoll = kr + s_hlDev[1] * 0.6f * bf;
+                    g_carTiltP = s_tP * bf; g_carTiltR = s_tR * bf; g_carTiltOK = 1;
+                }
+                hx = rm[12] + rm[0] * L[0] + rm[4] * L[1] + rm[8] * L[2];
+                hy = rm[13] + rm[1] * L[0] + rm[5] * L[1] + rm[9] * L[2];
+                hz = rm[14] + rm[2] * L[0] + rm[6] * L[1] + rm[10] * L[2]
+                     + 0.06f - g_eyeTrimV[vi];    // just above the head bone (the car trim is added below)
+            }
+        }
+    }
+    else
+    {
+        s_locOK = 0; s_locExact = 0; s_dynOK = 0; s_velOK = 0; s_leanF = s_leanS = s_accF = s_accS = 0.f; s_crashT = s_crashW = 0.f; s_crashDev[0] = s_crashDev[1] = s_crashDev[2] = 0.f;
+        for (int j = 0; j < 3; ++j) { s_jx[j] = 0.f; s_jvel[j] = 0.f; }
+        s_jSeenOK = 0; s_hlOK = 0; s_hlDev[0] = s_hlDev[1] = 0.f; s_tP = s_tR = 0.f;
+    }
+}
+
 static uint32_t g_lastPollFrame = 0;
 static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully populated
 {
@@ -678,6 +1083,8 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
     FP_TRY
     {
         bool inCs = g_cutsceneName && g_cutsceneName[0] != '\0';
+        // pad23: keep learning the car's seat pose even in third person (once per game frame inside)
+        { float tx = 0.f, ty = 0.f, tz = 0.f; CarPoseBlock(inCs, g_inTrain ? 2 : (g_inCar ? 1 : 0), tx, ty, tz); }
         // pad4: the radar (minimap) is drawn through this same hook with a camera high above the
         // player looking straight down -- leave it alone, otherwise the minimap turns into a tilted 3D view
         // pad5: the minimap camera sits tens of metres from the player -- any gameplay camera is far closer
@@ -713,6 +1120,7 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         // ---- head-anchored FP (gameplay, vehicles, subway AND cutscenes, via natives) ----
         // pick the anchor: cutscene actor if in a cutscene, else the real head bone
         float hx, hy, hz;
+        g_footHeadOK = 0; g_kickPitch = 0.f; g_kickRoll = 0.f; g_carTiltOK = 0;   // pad21: refreshed below every frame
         if (inCs && g_csPedOK)
         {
             hx = g_csPedW[0]; hy = g_csPedW[1]; hz = g_csPedW[2] + g_eyeUp;   // actor pos + eye
@@ -770,7 +1178,7 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
                 {
                     float m[16];
                     g_GetBoneMtx(pd, m, 1205);
-                    if (m[12] || m[13] || m[14]) { hx = m[12]; hy = m[13]; hz = m[14]; freshOK = true; }
+                    if (m[12] || m[13] || m[14]) { hx = m[12]; hy = m[13]; hz = m[14]; freshOK = true; memcpy(g_footHead, m, sizeof m); g_footHeadOK = 1; }
                 }
             }
             if (!freshOK) { hx = g_headMtx[12]; hy = g_headMtx[13]; hz = g_headMtx[14]; }
@@ -792,217 +1200,7 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         // pad7: in a car the eye sits on Niko's real head, but the head bone is one update behind the car
         // (at speed the view slid back toward the rear seat). So learn where the head sits RELATIVE to the
         // ped root while the car is slow, and place it on the fresh root every frame.
-        {
-            static float s_loc[3] = { 0, 0, 0 }; static int s_locOK = 0; static int s_locExact = 0;
-            static float s_dyn[3] = { 0, 0, 0 }; static int s_dynOK = 0;
-            static float s_vel[2] = { 0, 0 }, s_velPrev[2] = { 0, 0 }; static int s_velOK = 0;
-            static float s_accF = 0.f, s_accS = 0.f, s_leanF = 0.f, s_leanS = 0.f;
-            static float s_crashT = 0.f, s_crashW = 0.f, s_crashDev[3] = { 0, 0, 0 };
-            static float s_prevRoot[3] = { 0, 0, 0 }; static uint32_t s_prevFc = 0; static float s_speed = 0.f;
-            static LONGLONG s_prevQ = 0;
-            if (!inCs && (g_inCar || g_carTransition) && !g_inTrain && g_GetBoneMtx && g_FindPlayerPed)
-            {
-                void* pd = g_FindPlayerPed(0);
-                float* rm = pd ? *(float**)((char*)pd + 0x20) : nullptr;
-                if (rm)
-                {
-                    const uint32_t fcn = FrameNo();
-                    if (fcn != s_prevFc)
-                    {
-                        LARGE_INTEGER q; QueryPerformanceCounter(&q);
-                        LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
-                        const float dt = s_prevQ ? (float)((double)(q.QuadPart - s_prevQ) / (double)qf.QuadPart) : 0.f;
-                        if (dt > 0.001f && dt < 0.25f)
-                        {
-                            const float ddx = rm[12] - s_prevRoot[0], ddy = rm[13] - s_prevRoot[1], ddz = rm[14] - s_prevRoot[2];
-                            s_speed = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz) / dt;
-                        }
-                        // pad12: g-forces. Velocity from the root, then its change = acceleration in the car's
-                        // own axes; braking / crashing throws the eye forward, corners push it sideways.
-                        if (dt > 0.001f && dt < 0.25f)
-                        {
-                            const float vx = (rm[12] - s_prevRoot[0]) / dt, vy = (rm[13] - s_prevRoot[1]) / dt;
-                            const float kv = 1.f - expf(-dt / 0.03f);
-                            s_vel[0] += (vx - s_vel[0]) * kv; s_vel[1] += (vy - s_vel[1]) * kv;
-                            if (s_velOK)
-                            {
-                                const float ax = (s_vel[0] - s_velPrev[0]) / dt, ay = (s_vel[1] - s_velPrev[1]) / dt;
-                                const float aFwd = ax * rm[4] + ay * rm[5];     // + = speeding up
-                                const float aSide = ax * rm[0] + ay * rm[1];    // + = pushed to the right
-                                const float ka = 1.f - expf(-dt / 0.035f);
-                                s_accF += (aFwd - s_accF) * ka; s_accS += (aSide - s_accS) * ka;
-                                if (g_simAccOK) { s_accF = g_simAccF; s_accS = g_simAccS; }   // pad15
-                            }
-                            s_velPrev[0] = s_vel[0]; s_velPrev[1] = s_vel[1]; s_velOK = 1;
-                            // target lean: forward when braking / crashing, sideways (outward) in corners
-                            float tF = -s_accF * 0.022f; if (tF < -0.04f) tF = -0.04f; if (tF > 0.30f) tF = 0.30f;
-                            float tS = -s_accS * 0.012f; if (tS > 0.10f) tS = 0.10f; if (tS < -0.10f) tS = -0.10f;
-                            const float kF = 1.f - expf(-dt / (tF > s_leanF ? 0.06f : 0.20f));   // pad13: quicker whip and settle
-                            const float kS = 1.f - expf(-dt / 0.10f);
-                            // pad13: crash = a big jolt; for a moment the eye follows Niko's real head
-                            if (fabsf(s_accF) > 18.f || fabsf(s_accS) > 14.f) s_crashT = 1.6f;
-                            else if (s_crashT > 0.f) s_crashT -= dt;
-                            s_leanF += (tF - s_leanF) * kF; s_leanS += (tS - s_leanS) * kS;
-                        }
-                        s_prevQ = q.QuadPart; s_prevFc = fcn;
-                        s_prevRoot[0] = rm[12]; s_prevRoot[1] = rm[13]; s_prevRoot[2] = rm[14];
-                        float b[16];
-                        g_GetBoneMtx(pd, b, 1205);
-                        // pad9: keep the last few root matrices. The head bone lags the root by a frame or
-                        // two; find WHICH old root it matches (the one whose head offset stays steadiest at
-                        // speed) and use that offset live -- so braking, crashing and cornering move the eye
-                        // with Niko's head (the lean), instead of his body sliding into view.
-                        static float s_hist[6][12]; static int s_histN = 0;
-                        for (int h = 5; h > 0; --h) memcpy(s_hist[h], s_hist[h - 1], sizeof(s_hist[0]));
-                        { const int idx[12] = { 0,1,2, 4,5,6, 8,9,10, 12,13,14 }; for (int j = 0; j < 12; ++j) s_hist[0][j] = rm[idx[j]]; }
-                        if (s_histN < 6) ++s_histN;
-                        static float s_mean[6][3], s_var[6]; static int s_varN = 0;
-                        // pad19: the head-bone lag and the seated head pose are remembered between sessions
-                        // ([Internal] in the .ini), so the very first car of a session starts right even at speed.
-                        static int s_bestK = -1; static float s_saved[3] = { 0, 0, 0 }; static int s_savedOK = 0;
-                        if (s_bestK < 0)
-                        {
-                            s_bestK = (int)GetPrivateProfileIntA("Internal", "CarHeadLag", 2, g_iniPath);
-                            if (s_bestK < 0 || s_bestK > 5) s_bestK = 2;
-                            char t[64] = { 0 };
-                            GetPrivateProfileStringA("Internal", "CarSeatPose", "", t, sizeof t, g_iniPath);
-                            if (sscanf(t, "%f,%f,%f", &s_saved[0], &s_saved[1], &s_saved[2]) == 3 &&
-                                fabsf(s_saved[0]) < 1.5f && fabsf(s_saved[1]) < 1.5f && fabsf(s_saved[2]) < 2.0f) s_savedOK = 1;
-                            Log("pad19 remembered: lag=%d seatPose=%s", s_bestK, s_savedOK ? t : "none");
-                        }
-                        const bool boneOK = (b[12] || b[13] || b[14]);
-                        if (boneOK)
-                        {
-                            float lk[6][3];
-                            for (int k = 0; k < s_histN; ++k)
-                            {
-                                const float* H = s_hist[k];
-                                const float dx = b[12] - H[9], dy = b[13] - H[10], dz = b[14] - H[11];
-                                lk[k][0] = dx * H[0] + dy * H[1] + dz * H[2];
-                                lk[k][1] = dx * H[3] + dy * H[4] + dz * H[5];
-                                lk[k][2] = dx * H[6] + dy * H[7] + dz * H[8];
-                            }
-                            if (s_speed > 6.0f && s_histN == 6)
-                            {
-                                for (int k = 0; k < 6; ++k)
-                                {
-                                    float e = 0.f;
-                                    for (int j = 0; j < 3; ++j) { const float dd = lk[k][j] - s_mean[k][j]; e += dd * dd; s_mean[k][j] += dd * 0.05f; }
-                                    s_var[k] = s_varN ? s_var[k] + (e - s_var[k]) * 0.02f : e;   // pad10: slower, steadier
-                                }
-                                if (++s_varN > 60)
-                                {
-                                    int best = 0; for (int k = 1; k < 6; ++k) if (s_var[k] < s_var[best]) best = k;
-                                    // pad10: only switch when clearly better (it flip-flopped in zig-zags)
-                                    if (best != s_bestK && s_var[best] > s_var[s_bestK] * 0.6f) best = s_bestK;
-                                    if (best != s_bestK)
-                                    {
-                                        s_bestK = best; Log("pad9 car head lag = %d frame(s)", best);
-                                        char v[8]; snprintf(v, sizeof v, "%d", best);
-                                        WritePrivateProfileStringA("Internal", "CarHeadLag", v, g_iniPath);
-                                        // pad19: pose was only a moving guess -> redo it with the measured lag
-                                        if (s_locOK && !s_locExact && best < s_histN)
-                                        { s_loc[0] = lk[best][0]; s_loc[1] = lk[best][1]; s_loc[2] = lk[best][2]; }
-                                    }
-                                }
-                            }
-                            // pad13: first sample in the seat -> start from the lag-matched head right away
-                            // (before, the pose was only learned once the car nearly stopped).
-                            if (!s_locOK && g_inCar && !g_carTransition && s_histN >= 3)
-                            {
-                                int ks = s_bestK < s_histN ? s_bestK : s_histN - 1;
-                                if (s_savedOK && s_speed > 1.0f)
-                                {
-                                    float bd = 1e9f;
-                                    for (int k = 0; k < s_histN; ++k)
-                                    {
-                                        const float d0 = lk[k][0] - s_saved[0], d1 = lk[k][1] - s_saved[1], d2 = lk[k][2] - s_saved[2];
-                                        const float d = d0 * d0 + d1 * d1 + d2 * d2;
-                                        if (d < bd) { bd = d; ks = k; }
-                                    }
-                                }
-                                const float* l1 = (s_savedOK && s_speed > 1.0f && s_histN < 6) ? s_saved : lk[ks];
-                                if (fabsf(l1[0]) < 1.5f && fabsf(l1[1]) < 1.5f && fabsf(l1[2]) < 2.0f)
-                                {
-                                    s_loc[0] = l1[0]; s_loc[1] = l1[1]; s_loc[2] = l1[2]; s_locOK = 1; s_locExact = (s_speed < 1.0f);
-                                    Log("pad13 seat pose seeded while moving (%.1f m/s)", s_speed);
-                                }
-                            }
-                            // pad13: and keep refining it slowly while cruising smoothly
-                            if (s_locOK && s_speed >= 1.0f && s_varN > 60 && s_crashT <= 0.f && fabsf(s_accF) < 1.5f && fabsf(s_accS) < 1.5f)
-                            {
-                                const float* lc = lk[s_bestK < s_histN ? s_bestK : 1];
-                                if (fabsf(lc[0] - s_loc[0]) < 0.3f && fabsf(lc[1] - s_loc[1]) < 0.3f && fabsf(lc[2] - s_loc[2]) < 0.3f)
-                                    for (int j = 0; j < 3; ++j) s_loc[j] += (lc[j] - s_loc[j]) * 0.01f;
-                            }
-                            // pad13: crash -- follow where the head is thrown (beyond a small dead zone)
-                            {
-                                const float* lc = lk[s_bestK < s_histN ? s_bestK : 1];
-                                static const float clo[3] = { -0.40f, -0.05f, -0.30f }, chi[3] = { 0.40f, 0.50f, 0.15f };
-                                for (int j = 0; j < 3; ++j)
-                                {
-                                    float v = s_locOK ? lc[j] - s_loc[j] : 0.f;
-                                    v = v > 0.05f ? v - 0.05f : (v < -0.05f ? v + 0.05f : 0.f);
-                                    if (v > chi[j]) v = chi[j];
-                                    if (v < clo[j]) v = clo[j];
-                                    s_crashDev[j] += (v - s_crashDev[j]) * 0.35f;
-                                }
-                                const float wt = s_crashT > 0.f ? 1.f : 0.f;
-                                s_crashW += (wt - s_crashW) * (wt > s_crashW ? 0.4f : 0.06f);
-                            }
-                            if (s_speed < 1.0f && fabsf(s_accF) < 1.0f)    // pad12: only when really settled
-                            {
-                                const float* l0 = lk[0];
-                                if (fabsf(l0[0]) < 1.5f && fabsf(l0[1]) < 1.5f && fabsf(l0[2]) < 2.0f)
-                                {
-                                    const float a = (s_locOK && s_locExact) ? 0.15f : 1.f;
-                                    s_loc[0] += (l0[0] - s_loc[0]) * a; s_loc[1] += (l0[1] - s_loc[1]) * a; s_loc[2] += (l0[2] - s_loc[2]) * a;
-                                    s_locOK = 1;
-                                    static uint32_t s_saveFc = 0;
-                                    if (!s_locExact || fcn - s_saveFc > 600)
-                                    {
-                                        s_saveFc = fcn;
-                                        char v[64]; snprintf(v, sizeof v, "%.3f,%.3f,%.3f", s_loc[0], s_loc[1], s_loc[2]);
-                                        WritePrivateProfileStringA("Internal", "CarSeatPose", v, g_iniPath);
-                                        s_saved[0] = s_loc[0]; s_saved[1] = s_loc[1]; s_saved[2] = s_loc[2]; s_savedOK = 1;
-                                    }
-                                    s_locExact = 1;
-                                }
-                            }
-                            // live offset (lag-matched), smoothed a touch and kept within 0.35 m of the seated pose
-                            const int kk = s_bestK < s_histN ? s_bestK : s_histN - 1;
-                            if (s_locOK && kk >= 0 && s_varN > 60)   // only once the lag has been measured
-                            {
-                                // pad10: per-axis limits around the seated pose (x side, y forward, z up). Never
-                                // BEHIND the seat pose -- that is what showed the body in zig-zags.
-                                static const float lo[3] = { -0.15f, -0.02f, -0.10f }, hi[3] = { 0.15f, 0.35f, 0.10f };
-                                for (int j = 0; j < 3; ++j)
-                                {
-                                    float v = lk[kk][j] - s_loc[j];
-                                    if (v > hi[j]) v = hi[j];
-                                    if (v < lo[j]) v = lo[j];
-                                    v += s_loc[j];
-                                    s_dyn[j] = s_dynOK ? s_dyn[j] + (v - s_dyn[j]) * 0.3f : v;
-                                }
-                                s_dynOK = 1;
-                            }
-                        }
-                    }
-                    if (s_locOK)
-                    {
-                        (void)s_dynOK;
-                        const float L[3] = { s_loc[0] + s_leanS + s_crashDev[0] * s_crashW,
-                                             s_loc[1] + s_leanF + s_crashDev[1] * s_crashW,
-                                             s_loc[2] + s_crashDev[2] * s_crashW };
-                        hx = rm[12] + rm[0] * L[0] + rm[4] * L[1] + rm[8] * L[2];
-                        hy = rm[13] + rm[1] * L[0] + rm[5] * L[1] + rm[9] * L[2];
-                        hz = rm[14] + rm[2] * L[0] + rm[6] * L[1] + rm[10] * L[2]
-                             + 0.06f - g_eyeTrimV[vi];    // just above the head bone (the car trim is added below)
-                    }
-                }
-            }
-            else { s_locOK = 0; s_locExact = 0; s_dynOK = 0; s_velOK = 0; s_leanF = s_leanS = s_accF = s_accS = 0.f; s_crashT = s_crashW = 0.f; s_crashDev[0] = s_crashDev[1] = s_crashDev[2] = 0.f; }
-        }
+        CarPoseBlock(inCs, vi, hx, hy, hz);
         hz += g_eyeTrimV[vi];                                                 // F11/F12 fine nudge
 
         // Aim alignment. The game aims from its own aim camera (CCamAimWeapon), not
@@ -1015,7 +1213,9 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         static bool  s_aimWas = false;
         static LONGLONG s_aimQpc = 0; static double s_qpcInv = 0.0;
         const float* aimF = nullptr;
-        if (g_aimAlign && g_seedYawSet && !inCs && !g_inCar && !g_inTrain && !g_isRagdoll && !g_boneRot)
+        // pad21: not while fighting with fists / a melee weapon (nothing to shoot): the melee view owns the yaw then
+        const bool meleeFight = g_meleeTgt && (g_curWeaponSlot == 0 || g_curWeaponSlot == 1);
+        if (g_aimAlign && g_seedYawSet && !inCs && !g_inCar && !g_inTrain && !g_isRagdoll && !g_boneRot && !meleeFight)
             aimF = FindAimCamFrame();
         {
             if (s_qpcInv == 0.0) { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); s_qpcInv = 1.0 / (double)qf.QuadPart; }
@@ -1197,9 +1397,11 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
                     s_fOK = 1;
                 }
                 // pad17: melee view. The game's fight camera frames the fight from the side; instead keep the
-                // locked opponent near the middle of the screen. Screen centre = 0, edge = 100 (each axis):
-                //  - never beyond 40 (the view is pushed so he stays inside that box)
-                //  - beyond 10 the view eases back to centre in about 3 s; inside 10 it is left alone.
+                // opponent in the middle of the screen. Screen centre = 0, edge = 100 (each axis):
+                //  - never beyond 22 sideways / 25 up-down (the view is pushed so he stays inside that box)
+                //  - beyond 4 the view eases back to centre (~1 s); inside 4 it is left alone.
+                // pad21: the opponent is the locked-on ped, or, in a free fight (no lock-on), the one the sim
+                // thread picked (see PollNativesInner).
                 float mYaw = s_fYaw, mPitch = s_fPitch;
                 {
                     static float s_vYaw = 0.f, s_vPitch = 0.f, s_mW = 0.f; static int s_vOK = 0;
@@ -1214,33 +1416,44 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
                     if (tg)
                     {
                         FP_TRY {
+                            // pad25: aim at the opponent's head bone (a bit below, the face / neck), so the view
+                            // also follows him up and down: stairs, falling to the floor, getting back up. The
+                            // ped root stays put while he ragdolls, so it only moved the view sideways.
+                            float bm[16] = { 0 };
+                            if (g_GetBoneMtx) g_GetBoneMtx(tg, bm, 1205);
                             float* pm = *(float**)((char*)tg + 0x20);
-                            if (pm) { tp[0] = pm[12]; tp[1] = pm[13]; tp[2] = pm[14] + 0.45f; have = true; }
+                            const bool boneOK = (bm[12] || bm[13] || bm[14]) && pm &&
+                                                fabsf(bm[12] - pm[12]) < 3.f && fabsf(bm[13] - pm[13]) < 3.f && fabsf(bm[14] - pm[14]) < 3.f;
+                            if (boneOK) { tp[0] = bm[12]; tp[1] = bm[13]; tp[2] = bm[14] - 0.15f; have = true; }
+                            else if (pm) { tp[0] = pm[12]; tp[1] = pm[13]; tp[2] = pm[14] + 0.45f; have = true; }
                         }
                         FP_EXCEPT { have = false; }
                     }
                     if (have)
                     {
                         const float dx = tp[0] - hx, dy = tp[1] - hy, dz = tp[2] - hz;
-                        const float tYaw = atan2f(-dx, dy), tPitch = atan2f(dz, sqrtf(dx * dx + dy * dy));
+                        const float tYaw = atan2f(-dx, dy);
+                        float tPitch = atan2f(dz, sqrtf(dx * dx + dy * dy));
+                        if (tPitch > 0.7f) tPitch = 0.7f; if (tPitch < -1.0f) tPitch = -1.0f;   // very close / on the floor
                         if (!s_vOK || tg != s_last) { if (!s_vOK) { s_vYaw = s_fYaw; s_vPitch = s_fPitch; } s_vOK = 1; s_last = tg; }
                         const float vf = (dst[20] > 10.f && dst[20] < 120.f ? dst[20] : 45.f) * 0.01745329f;
                         const float halfV = vf * 0.5f, halfH = atanf(tanf(halfV) * 1.7778f);
-                        const float kc = 1.f - expf(-mdt / 1.0f);       // ~95% back to centre in 3 s
+                        const float kc = 1.f - expf(-mdt / 0.35f);      // pad21: ~95% back to centre in 1 s
+                        const float boxH = 0.22f, boxV = 0.25f, dead = 0.04f;
                         // horizontal
                         float ex = WrapPi(tYaw - s_vYaw), nx = ex / halfH;
-                        if (nx > 0.40f) s_vYaw = WrapPi(tYaw - 0.40f * halfH);
-                        else if (nx < -0.40f) s_vYaw = WrapPi(tYaw + 0.40f * halfH);
-                        else if (nx > 0.10f || nx < -0.10f) s_vYaw = WrapPi(s_vYaw + ex * kc);
+                        if (nx > boxH) s_vYaw = WrapPi(tYaw - boxH * halfH);
+                        else if (nx < -boxH) s_vYaw = WrapPi(tYaw + boxH * halfH);
+                        else if (nx > dead || nx < -dead) s_vYaw = WrapPi(s_vYaw + ex * kc);
                         // vertical
                         float ey = tPitch - s_vPitch, ny = ey / halfV;
-                        if (ny > 0.40f) s_vPitch = tPitch - 0.40f * halfV;
-                        else if (ny < -0.40f) s_vPitch = tPitch + 0.40f * halfV;
-                        else if (ny > 0.10f || ny < -0.10f) s_vPitch += ey * kc;
+                        if (ny > boxV) s_vPitch = tPitch - boxV * halfV;
+                        else if (ny < -boxV) s_vPitch = tPitch + boxV * halfV;
+                        else if (ny > dead || ny < -dead) s_vPitch += ey * kc;
                     }
                     else { s_vOK = 0; s_last = nullptr; }
-                    // ease the melee view in / out (0.2 s) so entering and leaving a fight doesn't snap
-                    s_mW += ((have ? 1.f : 0.f) - s_mW) * (1.f - expf(-mdt / 0.2f));
+                    // ease the melee view in (0.2 s) / out (0.45 s) so entering and leaving a fight doesn't snap
+                    s_mW += ((have ? 1.f : 0.f) - s_mW) * (1.f - expf(-mdt / (have ? 0.2f : 0.45f)));
                     if (!have && s_mW > 0.001f) { s_vYaw = WrapPi(s_vYaw); }
                     if (s_mW > 0.001f)
                     {
@@ -1286,6 +1499,76 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
         R[0] = F[1] * U[2] - F[2] * U[1]; R[1] = F[2] * U[0] - F[0] * U[2]; R[2] = F[0] * U[1] - F[1] * U[0];
         float rl = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]); if (rl > 1e-4f) { R[0] /= rl; R[1] /= rl; R[2] /= rl; }
 
+        // pad21: body follow, crash jolts and head sway -- rigid turns of the whole view frame
+        {
+            auto rotAbout = [](float* v, const float* k, float a) {   // Rodrigues: turn v about the unit axis k by a
+                const float c = cosf(a), s = sinf(a);
+                const float cx = k[1] * v[2] - k[2] * v[1], cyy = k[2] * v[0] - k[0] * v[2], cz = k[0] * v[1] - k[1] * v[0];
+                const float d = (k[0] * v[0] + k[1] * v[1] + k[2] * v[2]) * (1.f - c);
+                const float x = v[0] * c + cx * s + k[0] * d, yy = v[1] * c + cyy * s + k[1] * d, z = v[2] * c + cz * s + k[2] * d;
+                v[0] = x; v[1] = yy; v[2] = z;
+            };
+            // in a car the view tilts with the car (hills, bumps, banking): the whole frame turns about the
+            // car's own right axis (pitch) and then its nose (roll), so looking sideways / back stays right too
+            if (g_carTiltOK && vi == 1 && !inCs && g_vehHeadingOK && (g_carTiltP != 0.f || g_carTiltR != 0.f))
+            {
+                const float y = g_vehHeading * 0.01745329f;
+                const float Rc[3] = { cosf(y), sinf(y), 0.f };
+                float Fc[3] = { -sinf(y), cosf(y), 0.f };
+                rotAbout(R, Rc, g_carTiltP); rotAbout(F, Rc, g_carTiltP); rotAbout(U, Rc, g_carTiltP); rotAbout(Fc, Rc, g_carTiltP);
+                rotAbout(R, Fc, -g_carTiltR); rotAbout(F, Fc, -g_carTiltR); rotAbout(U, Fc, -g_carTiltR);
+            }
+            // on foot: the quick part of the head bone's own nod / tilt (walking and running sway, a punch
+            // landing). A slow baseline is taken out so it never fights where you look.
+            {
+                static float s_swB[2] = { 0, 0 }, s_swD[2] = { 0, 0 }, s_swW = 0.f; static int s_swOK = 0;
+                static LONGLONG s_swQ = 0; static double s_swInv = 0.0;
+                if (s_swInv == 0.0) { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); s_swInv = 1.0 / (double)qf.QuadPart; }
+                LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
+                float sdt = s_swQ ? (float)((qn.QuadPart - s_swQ) * s_swInv) : 0.f; s_swQ = qn.QuadPart;
+                if (sdt < 0.f || sdt > 0.25f) sdt = 0.f;
+                // ...and not while the view itself is swinging around (the head's look-at follows the view a
+                // moment later, which would read as a wobble)
+                static float s_pF[3] = { 0, 1, 0 }; static float s_rate = 0.f;
+                if (sdt > 0.f)
+                {
+                    const float dd = fmaxf(-1.f, fminf(1.f, F[0] * s_pF[0] + F[1] * s_pF[1] + F[2] * s_pF[2]));
+                    const float r = acosf(dd) / sdt;
+                    s_rate += (r - s_rate) * (1.f - expf(-sdt / 0.08f));
+                    s_pF[0] = F[0]; s_pF[1] = F[1]; s_pF[2] = F[2];
+                }
+                const bool on = vi == 0 && !inCs && g_footHeadOK && !aimF && !g_aimActive && !g_isRagdoll && !g_boneRot &&
+                                !g_carTransition && g_footSwayOn && g_footHeadSway > 0.f && s_rate < 1.2f;
+                if (vi == 0 && !inCs && g_footHeadOK)
+                {
+                    if (sdt > 0.f)
+                    {
+                        int fr = g_fwdRow & 3; if (fr > 2) fr = 0;
+                        const int rr = (fr + 1) % 3;
+                        const float sg = g_fwdSign ? -1.f : 1.f;
+                        const float hp = asinf(fmaxf(-1.f, fminf(1.f, g_footHead[fr * 4 + 2] * sg)));
+                        const float hr = asinf(fmaxf(-1.f, fminf(1.f, -g_footHead[rr * 4 + 2] * sg)));
+                        if (!s_swOK) { s_swB[0] = hp; s_swB[1] = hr; s_swOK = 1; }
+                        const float kb = 1.f - expf(-sdt / 0.30f), kd = 1.f - expf(-sdt / 0.04f);
+                        s_swB[0] += (hp - s_swB[0]) * kb; s_swB[1] += (hr - s_swB[1]) * kb;
+                        float d0 = hp - s_swB[0], d1 = hr - s_swB[1];
+                        if (d0 > 0.12f) d0 = 0.12f; if (d0 < -0.12f) d0 = -0.12f;
+                        if (d1 > 0.12f) d1 = 0.12f; if (d1 < -0.12f) d1 = -0.12f;
+                        s_swD[0] += (d0 - s_swD[0]) * kd; s_swD[1] += (d1 - s_swD[1]) * kd;
+                    }
+                }
+                else { s_swOK = 0; s_swD[0] = s_swD[1] = 0.f; }
+                s_swW += ((on ? 1.f : 0.f) - s_swW) * (1.f - expf(-sdt / 0.15f));
+                if (s_swW > 0.001f)
+                {
+                    g_kickPitch += s_swD[0] * g_footHeadSway * s_swW;
+                    g_kickRoll += s_swD[1] * g_footHeadSway * s_swW;
+                }
+            }
+            if (!inCs && g_kickPitch != 0.f) { const float Rk[3] = { R[0], R[1], R[2] }; rotAbout(F, Rk, g_kickPitch); rotAbout(U, Rk, g_kickPitch); }
+            if (!inCs && g_kickRoll != 0.f) { const float Fk[3] = { F[0], F[1], F[2] }; rotAbout(R, Fk, -g_kickRoll); rotAbout(U, Fk, -g_kickRoll); }
+        }
+
         dst[0] = R[0]; dst[1] = R[1]; dst[2] = R[2];
         dst[4] = F[0]; dst[5] = F[1]; dst[6] = F[2];
         dst[8] = U[0]; dst[9] = U[1]; dst[10] = U[2];
@@ -1301,26 +1584,57 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             float hxz = sqrtf(F[0] * F[0] + F[1] * F[1]);
             float fx = hxz > 1e-3f ? F[0] / hxz : 0.f, fy = hxz > 1e-3f ? F[1] / hxz : 0.f;
             const float down = F[2] < 0.f ? -F[2] : 0.f;          // sin(pitch down)
-            (void)down;   // pad14: fixed eye like the CLEO mod -- the phone in your hand stays in view
-            const float push = g_eyeFwdV[vi];
+            // pad14: a fixed eye (like the CLEO mod) keeps the phone in your hand in view. pad24: but without the
+            // phone, looking down moves the eye out over the chest again (up to +0.2 m forward, a touch higher),
+            // so you see your body and feet instead of into the neck.
+            static float s_dw = 0.f;
+            const float dwT = (g_phoneOut || g_phoneCall || aimF) ? 0.f : 1.f;
+            s_dw += (dwT - s_dw) * 0.1f;
+            const float push = g_eyeFwdV[vi] + down * 0.20f * s_dw;
             dst[12] = hx + fx * push;
             dst[13] = hy + fy * push;
-            dst[14] = hz;
+            dst[14] = hz + down * 0.03f * s_dw;
         }
         else
         {
             const float efw = g_eyeFwdV[vi] + (g_phoneCall ? 0.12f : 0.f);   // pad9: phone at the ear -> eye in front of the hand
-            dst[12] = hx + F[0] * efw;
-            dst[13] = hy + F[1] * efw;
-            dst[14] = hz + F[2] * efw;
-            // pad8: turning the head to the RIGHT in a car also leans toward the middle of the car, so the
-            // rear window shows instead of only the seat (up to 0.30 m at the full right turn)
-            if (vi == 1 && !inCs && g_vehHeadingOK && g_carYawOff < 0.f)
+            if (vi == 1 && !inCs && !g_onBike)   // on a bike the old nudge already showed the speedometer right
+            {
+                // pad24: in a vehicle the nudge goes along the LEVEL view direction (along the full view it sank into
+                // the chest when you looked down), and grows as you look down so you see over the chest and legs
+                float hxz = sqrtf(F[0] * F[0] + F[1] * F[1]);
+                const float fx = hxz > 1e-3f ? F[0] / hxz : 0.f, fy = hxz > 1e-3f ? F[1] / hxz : 0.f;
+                const float down = F[2] < 0.f ? -F[2] : 0.f;
+                const float push = efw + down * 0.15f;
+                dst[12] = hx + fx * push;
+                dst[13] = hy + fy * push;
+                dst[14] = hz + down * 0.04f;
+            }
+            else
+            {
+                dst[12] = hx + F[0] * efw;
+                dst[13] = hy + F[1] * efw;
+                dst[14] = hz + F[2] * efw;
+            }
+            // pad8: turning the head to the RIGHT in a car also leans toward the middle of the car, so the rear
+            // window shows instead of only the seat. pad24: and to the LEFT it leans toward the window, a bit less
+            // (the door is close). LookLeanRight / LookLeanLeft metres at the full turn.
+            if (vi == 1 && !inCs && g_vehHeadingOK && !g_vehLookBehind && g_carYawOff != 0.f)
             {
                 const float yv = g_vehHeading * 0.01745329f;
-                const float maxR = g_carLookRightDeg * 0.01745329f;
-                float k = -g_carYawOff / (maxR > 0.1f ? maxR : 0.1f); if (k > 1.f) k = 1.f;
-                const float lean = 0.30f * k;
+                float lean;
+                if (g_carYawOff < 0.f)
+                {
+                    const float maxR = g_carLookRightDeg * 0.01745329f;
+                    float k = -g_carYawOff / (maxR > 0.1f ? maxR : 0.1f); if (k > 1.f) k = 1.f;
+                    lean = g_carLeanRight * k;
+                }
+                else
+                {
+                    const float maxL = g_carLookLeftDeg * 0.01745329f;
+                    float k = g_carYawOff / (maxL > 0.1f ? maxL : 0.1f); if (k > 1.f) k = 1.f;
+                    lean = -g_carLeanLeft * k;
+                }
                 dst[12] += cosf(yv) * lean; dst[13] += sinf(yv) * lean;
             }
         }
@@ -1397,6 +1711,10 @@ static void __cdecl OnFinalCam(float* dst)     // dst = final cam matrix, fully 
             float f = dst[20] + g_fovBoostV[vi];
             if (f > 5.0f && f < 140.0f) dst[20] = f;
         }
+        // pad24: near clip. The eye sits where Niko's (hidden) head is, so his neck, shoulders and chest are a
+        // hand's width away and, looking down or to the side, you saw into them. Nothing nearer than NearClip
+        // is drawn (the game's own is 0.05 m); hands, the phone, guns and the wheel are all further away.
+        if (g_nearClipOK && dst[21] > 0.005f && dst[21] < 1.0f && g_nearClip > dst[21]) dst[21] = g_nearClip;
         g_outPos[0] = dst[12]; g_outPos[1] = dst[13]; g_outPos[2] = dst[14];
         ++g_applied;
     }
@@ -1409,6 +1727,8 @@ __declspec(naked) void RotStub()
     {
         mov    eax, [edi + 0x50]              // stolen 1: mov eax,[edi+50]
         mov[esi + 0x50], eax              // stolen 2: mov [esi+50],eax
+        mov    eax, [edi + 0x54]              // pad24: the next copy (near clip) done here, so the hook can change it
+        mov[esi + 0x54], eax
         pushad
         sub    esp, 0x20
         movups[esp + 0x00], xmm0
@@ -1420,7 +1740,7 @@ __declspec(naked) void RotStub()
         movups xmm1, [esp + 0x10]
         add    esp, 0x20
         popad
-        jmp    dword ptr[g_hookReturn]       // -> 0x83E39E
+        jmp    dword ptr[g_hookReturn2]      // -> 0x83E3A4 (or 0x83E39E if those bytes differ)
     }
 }
 
@@ -1553,6 +1873,14 @@ static bool InstallHook()
         return false;
     }
     g_hookReturn = site + 6;
+    {   // pad24: 83E39E copies the near clip (+0x54) after the hook; the stub does that copy itself and returns
+        // past it, so the near clip we write sticks. Only when the bytes are exactly that copy.
+        const uint8_t want2[6] = { 0x8B,0x47,0x54, 0x89,0x46,0x54 };
+        const bool same = memcmp((void*)(site + 6), want2, 6) == 0;
+        g_hookReturn2 = same ? site + 12 : site + 6;
+        g_nearClipOK = same ? 1 : 0;
+        Log("pad24 near clip control: %s", same ? "yes" : "no (unexpected bytes at 83E39E)");
+    }
     int32_t rel = (int32_t)((uintptr_t)&RotStub - (site + 5));
     DWORD op = 0;
     if (!VirtualProtect((void*)site, 6, PAGE_EXECUTE_READWRITE, &op)) return false;
@@ -1689,7 +2017,8 @@ static void ResolveStuff()
 
 // ---- poll game natives (worker thread) -----------------------------
 static volatile int g_natDbgPed = -1, g_natDbgBoneCalls = 0;
-static volatile int g_natTimer = -1;
+static volatile int g_natTimer = -1;   // pad25: game time in ms, kept running forward across save loads
+static volatile int g_loadEpoch = 0;   // pad25: +1 each time a save is loaded (the game timer jumps back)
 
 // ---- pad1: controller input + first person as a step of the game's camera button ----------
 // Sim thread (called from PollNativesInner). Controls are the game's own ePadControls ids.
@@ -1852,6 +2181,14 @@ static void PollController(int ped)
         int c = 0;
         if (fCall) { NativeCtx a; fCall(&a); c = a.resI() ? 1 : 0; }
         g_phoneCall = c;
+        static NativeFn fPhoneTask = NatFn(0x517B226E);   // GET_MOBILE_PHONE_TASK_SUB_TASK(ped, &sub) -> phone in hand
+        int po = 0;
+        if (fPhoneTask && ped) { int32_t sub = 0; NativeCtx a; a.pushI(ped); a.pushP(&sub); fPhoneTask(&a); po = a.resI() ? 1 : 0; }
+        g_phoneOut = po;
+        static NativeFn fOnBike = NatFn(0x0FB44F54);   // IS_CHAR_ON_ANY_BIKE(ped)
+        int ob = 0;
+        if (fOnBike && ped && g_inCar) { NativeCtx a; a.pushI(ped); fOnBike(&a); ob = a.resI() ? 1 : 0; }
+        g_onBike = ob;
     }
     // pad8: vehicle heading (the view centres on the car's own nose, not on the ped, who sits angled)
     {
@@ -1863,6 +2200,8 @@ static void PollController(int ped)
             int32_t car = 0; { NativeCtx a; a.pushI(ped); a.pushP(&car); fCarUsing(&a); }
             if (car)
             {
+                static NativeFn fCarModel = NatFn(0x5FF84497);   // GET_CAR_MODEL(car, &model)
+                if (fCarModel) { uint32_t mdl = 0; NativeCtx a; a.pushI(car); a.pushP(&mdl); fCarModel(&a); g_carModel = mdl; }
                 float h = 0.f; NativeCtx a; a.pushI(car); a.pushP(&h); fCarHeading(&a);
                 if (h > -400.f && h < 400.f) { g_vehHeading = h; ok = 1; }
                 // pad15: g-forces from the car's own physics speed + turn rate, once per game frame.
@@ -1883,9 +2222,55 @@ static void PollController(int ped)
                     g_simAccF = s_aF; g_simAccS = s_aS; g_simAccOK = 1;
                 }
                 if (dt > 0.f || !s_have) { s_sp = sp; s_hd = h; s_t = tn; s_have = ok; }
+                // pad21: crash jolts. When the car hits something -- or something hits it -- its velocity jumps
+                // within a game frame or two. That jump, in the car's own axes, goes to the camera, which throws
+                // the head the other way (hit from the left -> head to the left, and so on).
+                {
+                    static NativeFn fCarVel = NatFn(0x112E7FB1);   // GET_CAR_SPEED_VECTOR(car, &v, false)
+                    static int32_t s_jCar = 0; static float s_jv[3] = { 0, 0, 0 }; static uint32_t s_jt = 0; static int s_jOK = 0;
+                    static int s_world = 0, s_local = 0; static int s_frameLogged = 0;   // which frame the vector is in (checked while cruising)
+                    float v[3] = { 0, 0, 0 };
+                    bool got = false;
+                    if (fCarVel && ok)
+                    {
+                        NativeCtx c; c.pushI(car); c.pushP(v); c.pushI(0); fCarVel(&c); c.flushVec();
+                        got = v[0] == v[0] && v[1] == v[1] && v[2] == v[2] && fabsf(v[0]) < 250.f && fabsf(v[1]) < 250.f && fabsf(v[2]) < 250.f;
+                    }
+                    const float hr = h * 0.01745329f;
+                    const float fx = -sinf(hr), fy = cosf(hr), rx = cosf(hr), ry = sinf(hr);
+                    if (got && sp > 8.f)
+                    {
+                        // the native's frame isn't documented: world (along the heading) or the car's own (+y forward)
+                        const float n = sqrtf(v[0] * v[0] + v[1] * v[1]) + 1e-3f;
+                        const float aw = (v[0] * fx + v[1] * fy) / n, al = v[1] / n;
+                        if (aw > 0.9f && al < 0.7f && s_world < 1000) ++s_world;
+                        else if (al > 0.9f && aw < 0.7f && s_local < 1000) ++s_local;
+                        if (!s_frameLogged && s_world + s_local >= 30)
+                        { s_frameLogged = 1; Log("pad21 speed vector frame: %s (world %d / car %d)", s_local > s_world ? "car" : "world", s_world, s_local); }
+                    }
+                    const bool local = s_local > s_world;
+                    const float jdt = s_jt ? (float)(tn - s_jt) / 1000.f : 0.f;
+                    if (got && s_jOK && car == s_jCar && jdt > 0.f && jdt < 0.1f)
+                    {
+                        const float dx = v[0] - s_jv[0], dy = v[1] - s_jv[1], dz = v[2] - s_jv[2];
+                        const float dF = local ? dy : dx * fx + dy * fy;
+                        const float dS = local ? dx : dx * rx + dy * ry;
+                        const float mag = sqrtf(dF * dF + dS * dS + dz * dz);
+                        const float allow = 0.8f + 14.f * jdt;    // what hard braking / cornering / a fall can do in one frame
+                        if (mag > allow)
+                        {
+                            const float k = (mag - allow) / mag;
+                            g_impSumF += dF * k; g_impSumS += dS * k; g_impSumU += dz * k;
+                            if (mag > 2.5f) Log("pad21 impact: dv=%.1f m/s (forward %.1f, right %.1f, up %.1f)", mag, dF, dS, dz);
+                        }
+                    }
+                    if (got) { s_jv[0] = v[0]; s_jv[1] = v[1]; s_jv[2] = v[2]; s_jCar = car; s_jt = tn; s_jOK = 1; }
+                    else s_jOK = 0;
+                }
             }
         }
         if (!ok) g_simAccOK = 0;
+        if (!g_inCar || g_inTrain) g_carModel = 0;
         g_vehHeadingOK = ok;
     }
     // pad8: standing still and looking far away from where Niko faces -> he turns around, smoothly
@@ -2023,6 +2408,8 @@ static void PollController(int ped)
     (void)s_block; (void)s_unblockAt; (void)s_pre; (void)s_lastD; (void)s_incStreak; (void)s_footIdx; (void)s_pendAt;
     static int s_prevMode = -1, s_fpMode = -1;
     static uint32_t s_footGrace = 0;
+    static int s_footEpoch = 0;
+    if (s_footEpoch != g_loadEpoch) { s_footEpoch = g_loadEpoch; s_fpMode = -1; s_prevMode = -1; s_footGrace = 0; }   // pad25
     setBlock(0);
     const int mode = ReadFootMode();
     if (mode < 0) { s_prevMode = -1; return; }
@@ -2082,7 +2469,24 @@ static void PollNativesInner()
     // GTA IV ABI: value-returning natives take a trailing OUTPUT-POINTER arg
     // (void return in FusionFix's wrappers). vec3 outputs go via tempData[] and
     // need flushVec() to copy back into the caller's buffer.
-    if (fTimer) { uint32_t t = 0; NativeCtx a; a.pushP(&t); fTimer(&a); g_natTimer = (int)t; }
+    // pad25: loading a save puts GET_GAME_TIMER back to the save's time. Every "until" deadline in the mod
+    // (camera-button grace, head re-hide, fight lock) was then minutes in the future: the camera button
+    // was undone for ~13 min and the head stayed visible. Keep our own clock running forward instead,
+    // and count the load so per-session state can start over.
+    if (fTimer)
+    {
+        uint32_t t = 0; NativeCtx a; a.pushP(&t); fTimer(&a);
+        static uint32_t s_raw = 0, s_mono = 0; static int s_have = 0;
+        if (s_have)
+        {
+            uint32_t d = t - s_raw;
+            if (t < s_raw || d > 5000u) { ++g_loadEpoch; Log("pad25 game timer jumped %u -> %u: save loaded / new session", s_raw, t); d = 0; }
+            s_mono += d;
+        }
+        else s_mono = t;
+        s_raw = t; s_have = 1;
+        g_natTimer = (int)s_mono;
+    }
 
     int ped = 0;
     if (fGetPlayerChar) { NativeCtx a; a.pushI(0); a.pushP(&ped); fGetPlayerChar(&a); }
@@ -2098,7 +2502,7 @@ static void PollNativesInner()
         // pad17: which ped is locked on? ask the game for each ped near Niko (pool handle = index<<8 | flags)
         static NativeFn fTgtAny = NatFn(0x665F6BB7);   // IS_PLAYER_TARGETTING_ANYTHING(player)
         static NativeFn fTgtChar = NatFn(0x58A6457C);  // IS_PLAYER_TARGETTING_CHAR(player, ped)
-        void* tgt = nullptr;
+        void* volatile tgt = nullptr; volatile int32_t tgtH = 0;
         const bool meleeWpn = g_curWeaponSlot <= 1;      // unarmed / knife / bat
         if (ped && meleeWpn && !g_inCar && !g_inTrain && fTgtAny && fTgtChar && g_FindPlayerPed && g_pPedPoolPtr)
         {
@@ -2121,18 +2525,108 @@ static void PollNativesInner()
                             if (dx * dx + dy * dy + dz * dz > 10.f * 10.f) continue;
                             const int32_t h = (i << 8) | pp.flags[i];
                             NativeCtx b; b.pushI(0); b.pushI(h); fTgtChar(&b);
-                            if (b.resI()) tgt = pe;
+                            if (b.resI()) { tgt = pe; tgtH = h; }
                         }
                 }
-                FP_EXCEPT { tgt = nullptr; }
+                FP_EXCEPT { tgt = nullptr; tgtH = 0; }
             }
         }
-        g_meleeTgt = tgt;
+        // pad21: a free fight (no lock-on button held) never sets the player's target, so the view had nothing
+        // to centre on and the opponent drifted off screen with the game's side-on fight camera. Then pick the
+        // opponent ourselves: the closest living ped in front of the view (one who is fighting counts as
+        // closer), kept while he stays near and alive; the fight lasts while either of you keeps swinging.
+        {
+            static NativeFn fDead = NatFn(0x6A6B4F18);    // IS_CHAR_DEAD(ped)
+            static NativeFn fFatal = NatFn(0x4A7802CB);   // IS_CHAR_FATALLY_INJURED(ped)
+            static void* volatile s_opp = nullptr; static volatile int32_t s_oppH = 0; static volatile uint32_t s_fightUntil = 0;
+            static volatile int s_lost = 0;   // the opponent went down / away: from then on only someone who is fighting
+            const uint32_t tnow = (uint32_t)g_natTimer;
+            const bool footMelee = ped && meleeWpn && !g_inCar && !g_inTrain && g_FindPlayerPed && g_pPedPoolPtr && fMelee;
+            if (!footMelee) { s_opp = nullptr; s_oppH = 0; s_fightUntil = 0; s_lost = 0; }
+            else
+            {
+                if (m || tgt) s_fightUntil = tnow + 2500;
+                if (tgt) { s_opp = tgt; s_oppH = tgtH; }
+                else if ((int32_t)(s_fightUntil - tnow) > 0)
+                {
+                    FP_TRY {
+                        void* me = g_FindPlayerPed(0);
+                        float* mm = me ? *(float**)((char*)me + 0x20) : nullptr;
+                        Pool pp;
+                        if (mm && ReadPool(g_pPedPoolPtr, pp, 0x200))
+                        {
+                            bool keep = false;
+                            if (s_opp && s_oppH)
+                            {
+                                const int i = (int)(((uint32_t)s_oppH) >> 8);
+                                if (i < pp.size && !(pp.flags[i] & 0x80) && pp.flags[i] == (uint8_t)(s_oppH & 0xFF) &&
+                                    (void*)(pp.storage + i * pp.stride) == s_opp)
+                                {
+                                    float* pm = *(float**)((char*)s_opp + 0x20);
+                                    if (pm)
+                                    {
+                                        const float dx = pm[12] - mm[12], dy = pm[13] - mm[13], dz = pm[14] - mm[14];
+                                        bool alive = true;
+                                        if (fDead) { NativeCtx c; c.pushI(s_oppH); fDead(&c); if (c.resI()) alive = false; }
+                                        if (alive && fFatal) { NativeCtx c; c.pushI(s_oppH); fFatal(&c); if (c.resI()) alive = false; }
+                                        keep = alive && dx * dx + dy * dy < 6.5f * 6.5f && fabsf(dz) < 3.f;
+                                    }
+                                }
+                            }
+                            if (keep)
+                            {
+                                NativeCtx c; c.pushI(s_oppH); fMelee(&c);
+                                if (c.resI()) s_fightUntil = tnow + 2500;      // he is still swinging at you
+                            }
+                            else
+                            {
+                                if (s_opp) s_lost = 1;
+                                // view direction (what you are looking at), else where Niko faces
+                                const float vy = g_fpViewOK ? (float)g_fpYaw : (float)g_charHeading * 0.01745329f;
+                                const float vx0 = -sinf(vy), vy0 = cosf(vy);
+                                float best = 1e9f; void* bp = nullptr; int32_t bh = 0;
+                                for (int i = 0; i < pp.size; ++i)
+                                {
+                                    if (pp.flags[i] & 0x80) continue;
+                                    void* pe = pp.storage + i * pp.stride;
+                                    if (pe == me) continue;
+                                    float* pm = *(float**)((char*)pe + 0x20);
+                                    if (!pm) continue;
+                                    const float dx = pm[12] - mm[12], dy = pm[13] - mm[13], dz = pm[14] - mm[14];
+                                    const float d2 = dx * dx + dy * dy;
+                                    if (d2 > 4.5f * 4.5f || fabsf(dz) > 2.f) continue;
+                                    const float d = sqrtf(d2) + 0.01f;
+                                    const float cosA = (dx * vx0 + dy * vy0) / d;     // 1 = straight ahead
+                                    const int32_t h = (i << 8) | pp.flags[i];
+                                    int fighting = 0;
+                                    { NativeCtx c; c.pushI(h); fMelee(&c); fighting = c.resI() ? 1 : 0; }
+                                    if (cosA < -0.2f && !(fighting && d < 2.5f)) continue;   // behind you
+                                    if (s_lost && !fighting) continue;                        // not a bystander after a knockout
+                                    bool alive = true;
+                                    if (fDead) { NativeCtx c; c.pushI(h); fDead(&c); if (c.resI()) alive = false; }
+                                    if (alive && fFatal) { NativeCtx c; c.pushI(h); fFatal(&c); if (c.resI()) alive = false; }
+                                    if (!alive) continue;
+                                    float score = d * (1.f + 1.5f * (1.f - cosA));
+                                    if (fighting) score *= 0.5f;
+                                    if (score < best) { best = score; bp = pe; bh = h; }
+                                }
+                                s_opp = bp; s_oppH = bh;
+                                static void* s_logged = nullptr;
+                                if (bp && bp != s_logged) { s_logged = bp; Log("pad21 melee: picked an opponent (free fight, score %.1f)", best); }
+                            }
+                        }
+                    }
+                    FP_EXCEPT { s_opp = nullptr; s_oppH = 0; }
+                }
+                else { s_opp = nullptr; s_oppH = 0; s_lost = 0; }
+            }
+            g_meleeTgt = tgt ? (void*)tgt : (void*)s_opp;
+        }
         {   // pad19: diagnostics for the melee lock (logged only on change)
             static int s_prev = -1;
             int anyT = 0; if (ped && fTgtAny) { NativeCtx c; c.pushI(0); fTgtAny(&c); anyT = c.resI() ? 1 : 0; }
-            const int st = (g_inMelee ? 1 : 0) | (anyT ? 2 : 0) | (tgt ? 4 : 0) | (g_aimActive ? 8 : 0);
-            if (st != s_prev) { s_prev = st; Log("pad19 melee: inMelee=%d targetting=%d target=%d aimCam=%d slot=%d", st & 1, (st >> 1) & 1, (st >> 2) & 1, (st >> 3) & 1, g_curWeaponSlot); }
+            const int st = (g_inMelee ? 1 : 0) | (anyT ? 2 : 0) | (tgt ? 4 : 0) | (g_aimActive ? 8 : 0) | (g_meleeTgt ? 16 : 0);
+            if (st != s_prev) { s_prev = st; Log("pad19 melee: inMelee=%d targetting=%d target=%d aimCam=%d slot=%d centreOn=%d", st & 1, (st >> 1) & 1, (st >> 2) & 1, (st >> 3) & 1, g_curWeaponSlot, (st >> 4) & 1); }
         }
     }
     g_natDbgPed = ped;
@@ -2216,6 +2710,8 @@ static void PollNativesInner()
         static uint32_t nextReapply = 0;
         int want = (g_enabled && g_hideHead) ? 1 : 0;
         uint32_t now = (uint32_t)g_natTimer;
+        static int s_hideEpoch = 0; static int s_hidePed = 0;
+        if (s_hideEpoch != g_loadEpoch || s_hidePed != ped) { s_hideEpoch = g_loadEpoch; s_hidePed = ped; lastState = -1; g_seedYawSet = 0; }   // pad25: new Niko after a load
         if (want != lastState || (want != 0 && now >= nextReapply))
         {
             lastState = want;
@@ -2556,7 +3052,7 @@ static void PollNatives()
     if (!g_getNativeAddress && !(g_pNatives && g_pNativeSize)) return;
     if (g_codePause && *g_codePause) return;         // game code paused - not safe
     if (g_userPause && *g_userPause) return;
-    FP_TRY { PollNativesInner(); }
+    FP_TRY { PollNativesInner(); HudFrame(); }
     FP_EXCEPT_POLL
     {
         if ((++g_pollExc % 500) == 1)
@@ -2603,11 +3099,13 @@ static const IniEntry kIni[] =
     INI_S("General", "ToggleKey", SP_TOGGLE_KEY, true, false,
           "Key that turns first person on/off: F1-F12, a letter or digit, or a hex virtual-key code such as 0x76. Ctrl + this key toggles debug mode."),
     INI_S("General", "SaveKey", SP_SAVE_KEY, true, false,
-          "Key that saves your current in-game settings into this file (Ctrl + it reloads the file). Same key names as ToggleKey, or none to disable. Works with or without debug mode."),
+          "Key that saves your current in-game settings into this file. Ctrl + it opens the in-game settings menu (L3 + R3 on a controller). Same key names as ToggleKey, or none to disable."),
     INI_B("General", "ShowMessages", &g_showMsgs, true, true,
           "1 = show a short on-screen message when settings are saved or reloaded."),
     INI_S("General", "DebugMode", SP_DEBUG, false, false,
           "1 = debug mode starts on. It unlocks the live-tuning keys (see the README): tune with them in game, then press SaveKey to keep the values."),
+    INI_F("General", "NearClip", &g_nearClip, 0.05f, 0.30f, 2, true, true,
+          "Nothing closer to the camera than this (metres) is drawn. Raising it hides the inside of Niko's neck, shoulders and chest when you look down or to the side; too high starts cutting your hands, the phone or a gun. The game's own value is 0.05."),
     INI_B("General", "HideHead", &g_hideHead, true, true,
           "Hide Niko's head and hair so they don't block the view. Turn off only for debugging."),
     INI_F("General", "MouseSensitivity", &g_mouseSens, 0.0001f, 0.05f, 4, true, true,
@@ -2649,10 +3147,22 @@ static const IniEntry kIni[] =
 
     INI_F("OnFoot", "BaseFov", &g_footBaseFov, 0.0f, 120.0f, 1, true, true,
           "Field of view while looking level on foot; looking up/down still eases the game's own change in. 0 = the game's FOV."),
+    INI_B("OnFoot", "HeadSwayEnabled", &g_footSwayOn, true, true,
+          "1 = the view nods and tilts with Niko's head on foot; 0 = steady view (HeadSway keeps its amount for when you turn it back on). Also in the in-game menu (Ctrl+F5)."),
+    INI_F("OnFoot", "HeadSway", &g_footHeadSway, 0.0f, 1.0f, 2, true, true,
+          "How much the view nods and tilts with Niko's head on foot (walking and running sway, the jolt of a punch). Never while aiming. 0 = off, 1 = full."),
 
     INI_F("Car", "EyeHeight", &g_eyeTrimV[1], -1.0f, 1.5f, 3, true, true, nullptr),
     INI_F("Car", "EyeForward", &g_eyeFwdV[1], -0.5f, 1.0f, 3, true, true, nullptr),
     INI_F("Car", "FovBoost", &g_fovBoostV[1], -20.0f, 50.0f, 1, true, true, nullptr),
+    INI_F("Car", "LookLeanLeft", &g_carLeanLeft, 0.0f, 0.30f, 2, true, true,
+          "Turning your head fully to the LEFT also leans this many metres toward the window. 0 = no lean."),
+    INI_F("Car", "LookLeanRight", &g_carLeanRight, 0.0f, 0.40f, 2, true, true,
+          "Turning your head fully to the RIGHT also leans this many metres toward the middle of the car. 0 = no lean."),
+    INI_F("Car", "BodyFollow", &g_carBodyFollow, 0.0f, 1.0f, 2, true, true,
+          "How much the view moves with the car and Niko's body: it tilts with the car on hills, bumps and banked corners and nods / leans with his head. 0 = always level (old behaviour), 1 = full."),
+    INI_F("Car", "ImpactShake", &g_impactShake, 0.0f, 2.0f, 2, true, true,
+          "How hard crashes throw your head, toward the side of the hit: front crash = forward and down, rear-ended = back, hit from the left = to the left, hard landing = down. 0 = off, 1 = normal, 2 = double."),
 
     INI_F("Train", "EyeHeight", &g_eyeTrimV[2], -1.0f, 1.5f, 3, true, true, nullptr),
     INI_F("Train", "EyeForward", &g_eyeFwdV[2], -0.5f, 1.0f, 3, true, true, nullptr),
@@ -2845,8 +3355,8 @@ static void WriteDefaultIni()
     fprintf(f,
         "; FirstPersonCutscene.ini -- settings for the GTA IV first-person mod (" FPMOD_VERSION ").\n"
         "; The values below are the defaults. Delete a line (or this whole file) to get the default back.\n"
-        "; Edit while the game runs, then press Ctrl+SaveKey (Ctrl+F5 by default) to reload.\n"
-        "; In debug mode (Ctrl+ToggleKey) you can also tune live with the keys from the README and press\n"
+        "; Ctrl+SaveKey (Ctrl+F5 by default, or L3 + R3) opens an in-game menu for the main settings; after editing this file there, pick 'Recargar el .ini'.\n"
+        "; In debug mode (DebugMode = 1) you can also tune live with the keys from the README and press\n"
         "; SaveKey (F5) to write the current values back into this file. Lines starting with ; are comments.\n");
     const char* lastSec = "";
     for (const IniEntry& e : kIni)
@@ -2950,8 +3460,237 @@ static bool SaveIni()
 // the save-key action: Ctrl + key reloads the .ini, the key alone saves the current settings
 static void SaveKeyAction(bool ctrl)
 {
-    if (ctrl) Toast(LoadIni(false) ? "First person: settings reloaded" : "First person: no .ini found to reload");
+    if (ctrl) InterlockedExchange(&g_hudToggleReq, 1);   // pad22: Ctrl + SaveKey = the in-game settings menu
     else      Toast(SaveIni() ? "First person: settings saved to the .ini" : "First person: could not write the .ini");
+}
+
+// ---- pad22: in-game settings menu ---------------------------------------------------------
+// Ctrl + SaveKey (Ctrl+F5) or L3 + R3 opens / closes it. Arrows or the d-pad pick a line and change
+// it, Enter / Cross runs an action, Backspace / Circle (or Ctrl+F5 again) closes it. Changes apply
+// at once and are written to the .ini when the menu closes. Drawn with the game's own script text
+// natives on the sim thread; while it is up Niko and the game camera ignore the pad.
+enum HudType { HT_BOOL, HT_PCT, HT_NUM, HT_MOUSE, HT_FOV, HT_CM, HT_RELOAD, HT_CLOSE };
+struct HudItem { const char* label; HudType t; volatile float* pf; volatile int* pi; float lo, hi, step; };
+static const HudItem kHud[] = {
+    { "Balanceo de la vista a pie",           HT_BOOL,   nullptr,          &g_footSwayOn,    0.f,     1.f,   1.f   },
+    { "    Cuanto se balancea",               HT_PCT,    &g_footHeadSway,  nullptr,          0.f,     1.f,   0.05f },
+    { "Camara sigue al auto y al cuerpo",     HT_PCT,    &g_carBodyFollow, nullptr,          0.f,     1.f,   0.05f },
+    { "Golpe de cabeza en los choques",       HT_PCT,    &g_impactShake,   nullptr,          0.f,     2.f,   0.10f },
+    { "Sensibilidad del stick en vehiculos",  HT_NUM,    &g_carStickSpeed, nullptr,          0.5f,    10.f,  0.25f },
+    { "Sensibilidad del mouse",               HT_MOUSE,  &g_mouseSens,     nullptr,          0.0001f, 0.05f, 0.f   },
+    { "La vista vuelve al frente (vehiculo)", HT_BOOL,   nullptr,          &g_carAutoCenter, 0.f,     1.f,   1.f   },
+    { "Niko se da vuelta si miras atras",     HT_BOOL,   nullptr,          &g_bodyTurn,      0.f,     1.f,   1.f   },
+    { "Asomarse al mirar a la izquierda",     HT_CM,     &g_carLeanLeft,   nullptr,          0.f,     0.30f, 0.02f },
+    { "Asomarse al mirar a la derecha",       HT_CM,     &g_carLeanRight,  nullptr,          0.f,     0.40f, 0.02f },
+    { "Ojo hacia adelante a pie",             HT_CM,     &g_eyeFwdV[0],    nullptr,          -0.10f,  0.40f, 0.01f },
+    { "Ojo hacia adelante en vehiculos",      HT_CM,     &g_eyeFwdV[1],    nullptr,          -0.10f,  0.40f, 0.01f },
+    { "Ocultar el cuerpo pegado a la camara", HT_CM,     &g_nearClip,      nullptr,          0.05f,   0.30f, 0.01f },
+    { "Campo de vision a pie",                HT_FOV,    &g_fovBoostV[0],  nullptr,          -20.f,   50.f,  1.f   },
+    { "Campo de vision en vehiculos",         HT_FOV,    &g_fovBoostV[1],  nullptr,          -20.f,   50.f,  1.f   },
+    { "Recargar el .ini (deshacer cambios)",  HT_RELOAD, nullptr,          nullptr,          0.f,     0.f,   0.f   },
+    { "Guardar y cerrar",                     HT_CLOSE,  nullptr,          nullptr,          0.f,     0.f,   0.f   },
+};
+
+// pad26: Project Thunder CE (Ctrl+F7) and Project Birds CE (Ctrl+F6) have menus of their own that look the
+// same. Only one is up at a time: the open one writes its name into the environment variable IVMODS_MENU
+// (and whether the player had control into IVMODS_MENU_CTRL); a menu that finds another name there
+// closes itself without touching the controls, and the one on top hands them back when it closes.
+static void MenuEnvGet(const char* var, char* out, DWORD n)
+{
+    out[0] = 0; DWORD r = GetEnvironmentVariableA(var, out, n);
+    if (r == 0 || r >= n) out[0] = 0;
+}
+static bool AnyModMenuOpen() { char b[32]; MenuEnvGet("IVMODS_MENU", b, sizeof b); return b[0] != 0; }
+
+static bool GameHasFocus()
+{
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void HudValue(const HudItem& it, char* out, size_t n)
+{
+    switch (it.t)
+    {
+    case HT_BOOL:  snprintf(out, n, "%s", *it.pi ? "SI" : "NO"); break;
+    case HT_PCT:   snprintf(out, n, "%d %%", (int)floorf(*it.pf * 100.f + 0.5f)); break;
+    case HT_NUM:   snprintf(out, n, "%.2f", (double)*it.pf); break;
+    case HT_MOUSE: snprintf(out, n, "x %.2f", (double)(*it.pf / 0.0016f)); break;
+    case HT_FOV:   snprintf(out, n, "%+d", (int)floorf(*it.pf + 0.5f)); break;
+    case HT_CM:    snprintf(out, n, "%d cm", (int)floorf(*it.pf * 100.f + 0.5f)); break;
+    default:       out[0] = 0; break;
+    }
+}
+
+static void HudChange(const HudItem& it, int dir)
+{
+    switch (it.t)
+    {
+    case HT_BOOL: *it.pi = dir == 0 ? (*it.pi ? 0 : 1) : (dir > 0 ? 1 : 0); break;   // Enter flips, left = NO, right = SI
+
+    case HT_MOUSE:
+    {
+        float v = *it.pf * (dir > 0 ? 1.1f : 1.f / 1.1f);
+        *it.pf = fmaxf(it.lo, fminf(it.hi, v));
+        break;
+    }
+    case HT_PCT: case HT_NUM: case HT_FOV: case HT_CM:
+    {
+        float v = *it.pf + it.step * (float)dir;
+        v = floorf(v / it.step + 0.5f) * it.step;          // keep it on the grid
+        *it.pf = fmaxf(it.lo, fminf(it.hi, v));
+        break;
+    }
+    default: break;
+    }
+}
+
+static void HudFrame()
+{
+    static NativeFn fRect = NatFn(0x3B2526E3);     // DRAW_RECT(x, y, w, h, r, g, b, a) -- centre + size
+    static NativeFn fScale = NatFn(0x02C069E5);    // SET_TEXT_SCALE(w, h)
+    static NativeFn fColour = NatFn(0x19C967B5);   // SET_TEXT_COLOUR(r, g, b, a)
+    static NativeFn fFont = NatFn(0x75363BB5);     // SET_TEXT_FONT(font)
+    static NativeFn fShadow = NatFn(0x58F5023F);   // SET_TEXT_DROPSHADOW(on, r, g, b, a)
+    static NativeFn fText = NatFn(0x661B239A);     // DISPLAY_TEXT_WITH_LITERAL_STRING(x, y, gxt, text)
+    static NativeFn fHideHud = NatFn(0x60320FEB);  // HIDE_HUD_AND_RADAR_THIS_FRAME()
+    static NativeFn fBtn = NatFn(0x7FF21081);      // IS_BUTTON_PRESSED(pad, button)
+    static NativeFn fCtrlOn = NatFn(0x30CD2F1F);   // IS_PLAYER_CONTROL_ON(player)
+    static NativeFn fSetCtrl = NatFn(0x1A6203EA);  // SET_PLAYER_CONTROL(player, on)
+    static NativeFn fCamCtl = NatFn(0x57952546);   // SET_GAME_CAMERA_CONTROLS_ACTIVE(on)
+    enum { B_UP = 8, B_DOWN = 9, B_LEFT = 10, B_RIGHT = 11, B_CROSS = 16, B_CIRCLE = 17, B_L3 = 18, B_R3 = 19 };
+    static int s_sel = 0;
+    static uint32_t s_prev = 0; static DWORD s_repAt = 0;
+    static bool s_l3r3Was = false;
+
+    auto btn = [&](int b) -> bool { if (!fBtn) return false; NativeCtx a; a.pushI(0); a.pushI(b); fBtn(&a); return a.resI() != 0; };
+
+    // open / close
+    bool toggle = InterlockedExchange(&g_hudToggleReq, 0) != 0;
+    const bool l3r3 = btn(B_L3) && btn(B_R3);
+    if (l3r3 && !s_l3r3Was) toggle = true;
+    s_l3r3Was = l3r3;
+    auto closeHud = [&](bool save, bool handBack = true) {
+        g_hudOpen = 0;
+        if (handBack)
+        {
+            char hc[8]; MenuEnvGet("IVMODS_MENU_CTRL", hc, sizeof hc);
+            if (fCamCtl) { NativeCtx a; a.pushI(1); fCamCtl(&a); }
+            if (hc[0] == '1' && fSetCtrl) { NativeCtx a; a.pushI(0); a.pushI(1); fSetCtrl(&a); }
+            SetEnvironmentVariableA("IVMODS_MENU", nullptr);
+            SetEnvironmentVariableA("IVMODS_MENU_CTRL", nullptr);
+        }
+        if (save) Toast(SaveIni() ? "First person: ajustes guardados" : "First person: no se pudo guardar el .ini");
+        Log("pad22 settings menu closed (%s)", save ? "saved" : "not saved");
+    };
+    // pad26: another mod's menu (Ctrl+F6 / Ctrl+F7) was opened over this one: step aside
+    if (g_hudOpen)
+    {
+        char ow[32]; MenuEnvGet("IVMODS_MENU", ow, sizeof ow);
+        if (strcmp(ow, "fp") != 0) { closeHud(true, false); return; }
+    }
+    if (toggle)
+    {
+        if (g_hudOpen) closeHud(true);
+        else
+        {
+            g_hudOpen = 1; s_prev = 0xFFFFFFFFu;     // ignore whatever is still held from the opening press
+            char ow[32]; MenuEnvGet("IVMODS_MENU", ow, sizeof ow);
+            int had = -1;
+            if (!ow[0])                               // no other mod's menu is up: remember whether Niko had control
+            {
+                had = 0;
+                if (fCtrlOn) { NativeCtx a; a.pushI(0); fCtrlOn(&a); had = a.resI() ? 1 : 0; }
+                SetEnvironmentVariableA("IVMODS_MENU_CTRL", had ? "1" : "0");
+            }
+            SetEnvironmentVariableA("IVMODS_MENU", "fp");
+            Log("pad22 settings menu opened (player control was %s)", had < 0 ? "taken by another menu" : (had ? "on" : "off"));
+        }
+    }
+    if (!g_hudOpen) return;
+
+    // while it is up the pad drives the menu, not Niko or the camera
+    if (fSetCtrl) { NativeCtx a; a.pushI(0); a.pushI(0); fSetCtrl(&a); }
+    if (fCamCtl) { NativeCtx a; a.pushI(0); fCamCtl(&a); }
+    if (fHideHud) { NativeCtx a; fHideHud(&a); }
+
+    const HudItem* items[64]; int n = 0;
+    for (const HudItem& h : kHud) items[n++] = &h;
+    if (s_sel >= n) s_sel = n - 1;
+    if (s_sel < 0) s_sel = 0;
+    const bool focus = GameHasFocus();
+    auto key = [&](int vk) -> bool { return focus && (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    uint32_t cur = 0;
+    if (key(VK_UP) || btn(B_UP)) cur |= 1;
+    if (key(VK_DOWN) || btn(B_DOWN)) cur |= 2;
+    if (key(VK_LEFT) || btn(B_LEFT)) cur |= 4;
+    if (key(VK_RIGHT) || btn(B_RIGHT)) cur |= 8;
+    if (key(VK_RETURN) || btn(B_CROSS)) cur |= 16;
+    if (key(VK_BACK) || btn(B_CIRCLE)) cur |= 32;
+    const DWORD now = GetTickCount();
+    uint32_t hit = 0;
+    if (s_prev == 0xFFFFFFFFu) s_repAt = now + 400;     // just opened: what is held now doesn't count
+    else
+    {
+        hit = cur & ~s_prev;
+        if (hit) s_repAt = now + 400;                                                          // first repeat after 0.4 s...
+        else if ((cur & 15) && (int32_t)(now - s_repAt) >= 0) { hit = cur & 15; s_repAt = now + 70; }   // ...then quick
+    }
+    s_prev = cur;
+
+    if (hit & 1) s_sel = (s_sel + n - 1) % n;
+    if (hit & 2) s_sel = (s_sel + 1) % n;
+    const HudItem& it = *items[s_sel];
+    if (hit & 4) HudChange(it, -1);
+    if (hit & 8) HudChange(it, +1);
+    if (hit & 16)
+    {
+        if (it.t == HT_BOOL) HudChange(it, 0);
+        else if (it.t == HT_RELOAD) Toast(LoadIni(false) ? "First person: .ini recargado" : "First person: no se encontro el .ini");
+        else if (it.t == HT_CLOSE) { closeHud(true); return; }
+    }
+    if (hit & 32) { closeHud(true); return; }
+
+    // ---- draw ----
+    static char s_buf[64][112]; int nb = 0;
+    auto rect = [&](float cx, float cy, float w, float h, int r, int g, int b, int al) {
+        if (!fRect) return;
+        NativeCtx a; a.pushF(cx); a.pushF(cy); a.pushF(w); a.pushF(h); a.pushI(r); a.pushI(g); a.pushI(b); a.pushI(al); fRect(&a);
+    };
+    auto text = [&](float x, float y, const char* str, int r, int g, int b, float sx, float sy) {
+        if (!fText || nb >= 64) return;
+        char* t = s_buf[nb++];
+        strncpy_s(t, sizeof s_buf[0], str, _TRUNCATE);
+        if (fFont) { NativeCtx a; a.pushI(0); fFont(&a); }
+        if (fScale) { NativeCtx a; a.pushF(sx); a.pushF(sy); fScale(&a); }
+        if (fColour) { NativeCtx a; a.pushI(r); a.pushI(g); a.pushI(b); a.pushI(255); fColour(&a); }
+        if (fShadow) { NativeCtx a; a.pushI(1); a.pushI(0); a.pushI(0); a.pushI(0); a.pushI(255); fShadow(&a); }
+        NativeCtx a; a.pushF(x); a.pushF(y); a.pushP((void*)"STRING"); a.pushP(t); fText(&a);
+    };
+    const float x0 = 0.05f, w = 0.50f, rowH = 0.034f, top = 0.17f, xv = x0 + 0.37f;
+    const float panelH = rowH * (float)(n + 5);
+    rect(x0 + w * 0.5f, top - rowH * 1.2f + panelH * 0.5f, w, panelH, 8, 10, 14, 190);
+    text(x0 + 0.014f, top - rowH * 1.05f, "FIRST PERSON OVERHAUL IV - AJUSTES", 255, 196, 64, 0.30f, 0.42f);
+    for (int i = 0; i < n; ++i)
+    {
+        const float y = top + rowH * (float)i;
+        const bool sel = i == s_sel;
+        if (sel) rect(x0 + w * 0.5f, y + rowH * 0.45f, w - 0.008f, rowH * 0.92f, 255, 196, 64, 60);
+        const int c = sel ? 255 : 215;
+        text(x0 + 0.014f, y, items[i]->label, c, c, sel ? 160 : c, 0.24f, 0.34f);
+        char v[48]; HudValue(*items[i], v, sizeof v);
+        if (v[0])
+        {
+            char vv[64]; snprintf(vv, sizeof vv, sel ? "<  %s  >" : "%s", v);
+            text(xv, y, vv, c, c, sel ? 160 : c, 0.24f, 0.34f);
+        }
+    }
+    const float yf = top + rowH * (float)n + rowH * 0.35f;
+    text(x0 + 0.014f, yf, "A pie con mando: sensibilidad del juego (Ajustes > Controles)", 150, 150, 150, 0.20f, 0.29f);
+    text(x0 + 0.014f, yf + rowH * 0.8f, "Flechas o cruceta: elegir y cambiar   Enter o X: aceptar", 150, 150, 150, 0.20f, 0.29f);
+    text(x0 + 0.014f, yf + rowH * 1.6f, "Ctrl+F5, L3+R3 o Circulo: cerrar y guardar", 150, 150, 150, 0.20f, 0.29f);
 }
 
 // Camera-pool vtables already understood (RVAs, 1.2.0.59): the two final-frame mirrors (slots
@@ -3099,30 +3838,25 @@ static DWORD WINAPI Worker(LPVOID)
         if (g_debugMode && lmbNow && !lmbPrev) DumpAimState("SHOT");
         lmbPrev = lmbNow;
 
-        // The toggle key (F7 by default, ToggleKey in the .ini) is the only key that works
-        // without debug mode. Ctrl + it switches debug mode itself -- everything below only
+        // The toggle key (F7 by default, ToggleKey in the .ini) and SaveKey are the only keys that work
+        // without debug mode (DebugMode = 1 in the .ini) -- everything below only
         // fires while that's on.
+        // pad26: no Ctrl + F-key does anything here except Ctrl+F5 (the menu): Ctrl+F6 / Ctrl+F7 open
+        // Project Birds CE's / Project Thunder CE's menus. Debug mode comes only from DebugMode in the .ini.
+        const bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrlHeld) { k[0] = d[0]; k[1] = d[1]; k[2] = d[2]; k[3] = d[3]; k[4] = d[4]; k[9] = d[9]; }   // count as already pressed
         if (d[0] && !k[0])
         {
-            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             char kn[16]; VkName(g_toggleVk, kn, sizeof(kn));
-            if (ctrl)
-            {
-                g_debugMode = !g_debugMode;
-                Log("Ctrl+%s debugMode=%d", kn, g_debugMode);
-            }
-            else
-            {
-                g_enabled = g_enabled ? 0 : 1; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
-                Log("%s enabled=%d", kn, g_enabled);
-            }
+            g_enabled = g_enabled ? 0 : 1; g_seedYawSet = 0; g_lookYaw = g_lookPitch = 0;
+            Log("%s enabled=%d", kn, g_enabled);
         }
 
         // SaveKey (F5 by default) works with or without debug mode: press it after tuning to
-        // write the current settings into the .ini; Ctrl + it reloads the .ini
+        // write the current settings into the .ini; Ctrl + it opens the settings menu
         if (d[21] && !k[21]) SaveKeyAction((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
 
-        if (g_debugMode)
+        if (g_debugMode && !g_hudOpen && !AnyModMenuOpen())   // pad22: the arrows drive the settings menus while one is up
         {
         if (d[9] && !k[9]) { g_useNatives = !g_useNatives; Log("F6 useNatives=%d", g_useNatives); }
         if (d[12] && !k[12]) {
